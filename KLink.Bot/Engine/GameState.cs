@@ -511,7 +511,95 @@ public sealed class GameState
             GeneratedCardIds.Add(card.CardId);
         }
 
+        TraceHandChange(card, CardLocation.NotAvailable, location, "Create");
         return card;
+    }
+
+    /// <summary>
+    /// 诊断（env 门控）：手牌**进出流水账** —— 用来定位「手牌对不上」。
+    ///
+    /// 两种模式：
+    /// <list type="bullet">
+    /// <item><c>KLINK_TRACE_HANDOVER=1</c>：只在手牌**超过容量**时报一行（带调用栈）。</item>
+    /// <item><c>KLINK_TRACE_HAND=1</c>：**每一次**进/出手牌都报一行（带调用栈）——
+    ///   用来和动作流逐条对账。</item>
+    /// </list>
+    ///
+    /// ⚠️ **「手牌 &gt; 9」本身不是 bug 判据**（2026-10-04 更正）：手牌上限确实是
+    /// <see cref="HandCapacity"/> = 9（蓝图 `FetchCardsByLocation` case 3,4 → `IntConst(9)`），
+    /// 但蓝图只在**特定几道门**上查容量 —— `DrawSpecificCardFromDeckBySide`
+    /// （`BP_CardFunctions.g.cs:12406`，全函数 33 行）**根本没有门**，越界是**允许**的。
+    /// ⇒ 要判某一次进手是不是"多进了一张"，必须**先看该路径在蓝图里有没有门**
+    ///   （逐条对账表见 README §8.15）。
+    ///
+    /// 用法：`$env:KLINK_TRACE_HAND='1'`（或 `KLINK_TRACE_HANDOVER='1'`），然后跑 `--audit-replay`。
+    /// </summary>
+    private void TraceHandChange(CardInstance card, CardLocation oldLocation, CardLocation location,
+                                 string how)
+    {
+        bool overflowOnly = Environment.GetEnvironmentVariable("KLINK_TRACE_HANDOVER") == "1";
+        bool traceAll = Environment.GetEnvironmentVariable("KLINK_TRACE_HAND") == "1";
+        bool traceDeck = Environment.GetEnvironmentVariable("KLINK_TRACE_DECK") == "1";
+        if (!overflowOnly && !traceAll && !traceDeck)
+        {
+            return;
+        }
+
+        bool into = location == CardLocation.HandLeft || location == CardLocation.HandRight;
+        bool from = oldLocation == CardLocation.HandLeft || oldLocation == CardLocation.HandRight;
+        bool intoDeck = location == CardLocation.DeckLeft || location == CardLocation.DeckRight;
+        bool fromDeck = oldLocation == CardLocation.DeckLeft || oldLocation == CardLocation.DeckRight;
+
+        if (!into && !from && !intoDeck && !fromDeck)
+        {
+            return;
+        }
+
+        // 调用点都在 `card.Location` 已经改完之后 ⇒ 这个计数就是"变化**之后**的张数"
+        // （出手/出库那条路：`Cards(owner, oldLocation)` 已经不含这张卡了）。
+        int n = Cards(card.Owner, into ? location : intoDeck ? location : oldLocation).Count;
+
+        if (overflowOnly && !(into && n > HandCapacity))
+        {
+            return;
+        }
+
+        if (!overflowOnly && !traceAll && traceDeck)
+        {
+            // 只看牌库模式：手牌那两条不动（避免噪声）
+            if (!intoDeck && !fromDeck)
+            {
+                return;
+            }
+
+            if (!traceAll)
+            {
+                Console.Error.WriteLine(
+                    $"[DECK] t={Turn} {card.Owner} {oldLocation}->{location} 牌库={n} " +
+                    $"{card.Name}#{card.CardId} via {how}");
+                DumpFrames();
+                return;
+            }
+        }
+
+        Console.Error.WriteLine(
+            $"[HAND] t={Turn} {card.Owner} {oldLocation}->{location} 手牌={n}/{HandCapacity} " +
+            $"{card.Name}#{card.CardId} via {how}");
+        DumpFrames();
+    }
+
+    /// <summary>诊断用：打印前几帧 KLink 调用栈（点名"是哪条原语做的"）。</summary>
+    private static void DumpFrames()
+    {
+        var frames = Environment.StackTrace
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Where(f => f.Contains("KLink", StringComparison.Ordinal))
+            .Skip(2)   // 跳过本方法与 TraceHandChange
+            .Take(4);
+        foreach (string f in frames)
+        {
+            Console.Error.WriteLine($"            {f.Trim()}");
+        }
     }
 
     /// <summary>
@@ -704,6 +792,8 @@ public sealed class GameState
         {
             CardMoved?.Invoke(card, oldLocation, location);
         }
+
+        TraceHandChange(card, oldLocation, location, "Move");
     }
 
     /// <summary>

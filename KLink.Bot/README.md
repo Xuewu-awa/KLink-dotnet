@@ -1,6 +1,6 @@
 # KLink.Bot —— KARDS 规则内核（模拟器）
 
-> 从反编译产物重建的对局引擎。目标不是「训练」，先把内核跑对并**量化缺口**。
+> 从反编译产物重建的对局引擎。目标不是「训练优先」，而是先把内核跑对并**量化缺口**。
 >
 > 相关文档：`klink bot/docs/对局协议参考.md`（协议）、`klink bot/docs/卡组覆盖率.md`（验收标准）
 
@@ -158,9 +158,9 @@ tools/BotSim/Program.cs         验证运行器（decks / play / coverage）
 **② `action_data` 是「下标 → 字符串」，且含义随动作类型而变**
 
 ```
-PC  892257  {0:64, 1:3, 2:0,  3:0,  4:jJ, 84:11}   → 打出 card_unit_heinkel_he_111_waw
-AC  654612  {0:7,  1:59, 2:4H, 3:d3,        84:3 }   → 361_light_regiment 攻击 m4a1
-ML  892257  {0:74, 1:1,  2:yD,              84:11}   → 移动 card_unit_wolfhounds
+PC  900009  {0:64, 1:3, 2:0,  3:0,  4:jJ, 84:11}   → 打出 card_unit_heinkel_he_111_waw
+AC  900008  {0:7,  1:59, 2:4H, 3:d3,        84:3 }   → 361_light_regiment 攻击 m4a1
+ML  900009  {0:74, 1:1,  2:yD,              84:11}   → 移动 card_unit_wolfhounds
 ```
 
 ⚠️ **坑**：`0` 的取值（64/60/32…）**有些恰好是合法的 2 字符卡组码**，
@@ -168,16 +168,19 @@ ML  892257  {0:74, 1:1,  2:yD,              84:11}   → 移动 card_unit_wolfho
 
 用 `dotnet run --project tools/BotSim -- replay` 可以复看这份数据的解析结果。
 
-### 2. 规则细节尚未与客户端对齐
+### 2. 规则细节尚未与客户端完全对齐
 
 以下是**猜的**，需要真实回放逐帧确认（代码里都标了 `TODO 待回放确认`）：
 
-- 前线/支援线的槽位编码（`ECardLocationEnum` 里只有一个 `Board_Frontline`，
-  靠 `locationNumber` 区分，语义未知）
-- 前线容量（`FrontlineLimiter`）、支援线容量
-- kredit 上限（现按 12）、疲劳公式
-- 攻击结算顺序（反击 / Guard / Smokescreen / 伏击 的交互）
-- 效果生成卡的 `cardID` 分配规则
+- `BP_CardFunctions::CalculateDamageDealt` 已接入重甲、伏击、Shock、lethal 和伤害修正链；
+  真实回放仍需继续验证复杂的先后顺序与特殊卡组合。
+- `BP_CardFunctions::UpdateGuarded` 的真实语义是相邻 Guard 计算；当前实现仍是近似目标过滤。
+- `PinUnit` / `RemovePin` 的 `pinnedTurns` 临时状态尚未完整建模。
+- `PayCardCost` 的 `KreditsTax_AsEnemyTarget`、`PayMovementCost` 的行动费用触发尚未完整接入。
+- `ChangeFrontlineLimiter` 已接入；`GameplayRestriction` 的来源、时长、查询及抽牌/加槽/出牌/攻击/弃牌限制已接入，仍需用更多真实回放验证时机细节。
+- `MakeCardRetreat` 已按蓝图实现：前线优先退到本方半场，半场满或本来在半场时退回拥有者手牌；`cantRetreat` 和非在场目标不变。
+- `BP_CardFunctions` 的通用函数是规则首要证据来源；相关蓝图反编译结果见仓库审计文档，
+  不应把旧的 C# 近似行为反过来当成规则定义。
 
 **HQ 初始防御 20** 是可确证的（fyserver 注入的 bot 动作里出现 `{"side":"right","75":"20"}`）。
 
@@ -204,10 +207,11 @@ ML  892257  {0:74, 1:1,  2:yD,              84:11}   → 移动 card_unit_wolfho
 - `Forecast`（预报）机制语义未确认，先当 no-op 并计数
 - 触发递归深度上限 8（真实客户端用动作队列串行化，不会无限递归）
 
-### 5. 还缺棋盘状态
+### 5. 状态对拍资料仍需补全
 
-`docs/live-actions.json` 只有**动作**，没有**局面**。所以现在能做协议层核对，
-但还做不了「喂动作流进内核、逐帧 diff 状态」——那才是最终的正确性判据。
+仓库已经有 `GameState.SnapshotJson()`、服务端回放审计和部分真实快照能力；但旧的
+`docs/live-actions.json` 本身只有**动作**，不是完整的逐动作客户端局面。因此仍需要
+更多带动作序号的客户端状态快照，才能把所有差异都定位到首个字段。
 
 **需要客户端侧的状态导出**（游戏自带 `GetMatchCardsAsJsonString`，
 见 §下一步）。
@@ -231,10 +235,10 @@ ML  892257  {0:74, 1:1,  2:yD,              84:11}   → 移动 card_unit_wolfho
 
 ## 下一步（按优先级）
 
-1. **修跳转语义**（限制 1）—— 现在有 8,988 次/300 局的跳转走了「跳过剩余部分」的
-   保守路径，合法的 else 分支会被误跳过。需要按字节偏移建跳转表
-2. **拿一局真实回放** → 写重放器 + 逐帧 diff（让后面所有工作可验证的前提）
-3. **解出 `BalancedCards` 表**，修正 `_bal` / `_vet` 变体数值
-4. 补齐剩余 2~7 个原语（各卡组组合暴露的不同缺口）
-5. 定下前线模型，把 `MoveUnit` 的决策接进 `GreedyBot`
-6. 接神经网络：实现 `IPlayerPolicy` 即可，内核不用改
+1. 以 `BP_CardFunctions` 为依据，补齐 `CalculateDamageDealt`、`UpdateGuarded`、
+   `ExecuteOnDealDamageAddDamage` 等高影响通用规则。
+2. 完善 `ResetUnitOperations` / Fury、`PinUnit` / `pinnedTurns`、费用税和前线限制。
+3. 修复回放器的身份与区域诊断，避免对缺失手牌静默硬塞导致连锁假差异。
+4. 获取更多带动作序号的客户端快照，继续定位两个随机效果分岔。
+5. 解出 `BalancedCards` 表，修正 `_bal` / `_vet` 变体数值。
+6. 内核规则稳定后再生成训练数据、训练 NN，并用 `AotProbe` 验证宿主集成。

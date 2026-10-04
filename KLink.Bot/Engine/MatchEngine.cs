@@ -152,6 +152,58 @@ public sealed class MatchEngine
             oldLocation: oldLocation,
             newLocation: newLocation);
 
+        // ---- T49 `OnMoveFromFrontline` / `OnOtherCardMoveFromFrontline` ----
+        //
+        // 入口条件（蓝图 `CardLocationMoved`，本次逐行复核 `BP_CardFunctions.g.cs`）：
+        // <code>
+        // :5689  EqualEqual_ByteByte_ReturnValue_3 = (oldLocation == 7)   ; 7 = BoardFrontline
+        // :5691  _4 = (newLocation == 6) ; :5693 _5 = (newLocation == 5)
+        // :5695  BooleanOR(_4, _5)              ; 退到**某一方的半场**
+        // :5697  BooleanAND(OR, _3)             ; ★ 只在前线 → 半场 时成立
+        // :5699  if (!AND) → 整段跳过
+        // :5715  IsActionProcess → 假则跳过（内核未建模，与全内核一致地近似）
+        // :5733  ExecuteOnCardMoveFromFrontline(self, tmpCard)
+        // </code>
+        // ⚠️ 注意入口**不含"退回手牌/弃牌堆"** —— 只含"退回半场(5/6)"。
+        //
+        // 那个函数自己是**层 B 的同一形状**（`:15646-15705`）：
+        // <code>
+        // :15646  if (!cardMoved.isSuppressed) goto L_015C   ; ★ 门**只管自程序**
+        // :15648  FetchAllCardsWithEventTrigger(49)           ; 广播（压制时直落这里）
+        // :15673      GetStopFurtherActions() → 真 ⇒ 跳出整段
+        // :15679  L_015C: OnMoveFromFrontline(cardMoved)      ; 自程序
+        // :15681      goto L_004A                             ; ★ 跑完又跳回广播
+        // :15691          EqualEqual(item.cardID, cardMoved.cardID) ⇒ 跳过  ; 排除被移动的卡
+        // :15705          item.OnOtherCardMoveFromFrontline(cardMoved)
+        // </code>
+        // ⇒ **自程序带压制门、广播无条件**（只被 `stopFurtherActions` 挡）；
+        //    "排除被移动的卡自己"由 `OnOther*` 广播分支排除主体天然满足。
+        // 实参名逐字取 `_index.g.cs:4115` = `{ "cardMoved" }`。
+        //
+        // ⚠️ 5 张订阅卡（`card_unit_flaming_matilda_anzac` / `card_unit_raaf_walrus` /
+        //   `card_location_soviet_scen2` 等）在 22 局语料里 **0 命中** ⇒ **回放侧无信号**。
+        if (oldLocation == CardLocation.BoardFrontline
+            && (newLocation == CardLocation.BoardHqLeft || newLocation == CardLocation.BoardHqRight))
+        {
+            var fromFrontlineArgs = new object?[] { card };
+            var fromFrontlineNamed = new Dictionary<string, object?>(StringComparer.Ordinal)
+            {
+                ["cardMoved"] = card,
+            };
+
+            if (!card.Keywords.Contains(Keyword.Suppressed))
+            {
+                Api.FireTrigger("OnMoveFromFrontline", card, card.Owner,
+                    eventArgs: fromFrontlineArgs, namedArgs: fromFrontlineNamed);
+            }
+
+            if (!Api.GetStopFurtherActions())
+            {
+                Api.FireTrigger("OnOtherCardMoveFromFrontline", card, card.Owner,
+                    eventArgs: fromFrontlineArgs, namedArgs: fromFrontlineNamed);
+            }
+        }
+
         // ---- 前线归属重算（P0，2026-10-01 实测 replay-214436）----
         //
         // 出处 `out/bp-cardfn.json` → `CardLocationMoved`（61 条语句）：
@@ -719,6 +771,9 @@ public sealed class MatchEngine
         {
             Say($"{side.ToWire()} 手牌已满（{preQtyInHand}/{GameState.HandCapacity}），{card} 被弃掉");
             State.Move(card, CardLocation.Discard);
+            // T3 `OnAfterDeckChanged`：蓝图 `DrawTopCardFromDeck` 是 8 个调用方之一
+            //（`:12494`）—— **两条分支**（抽到手 / 手牌满烧掉）都在那个函数体内。
+            Api.FireDeckChanged(side);
             FireSubAction("ZActionDrawCardFromDeck", new[]
             {
                 ActionValue2.Int("cardID", card.CardId),
@@ -731,6 +786,8 @@ public sealed class MatchEngine
         }
 
         State.Move(card, side.HandOf());
+        // T3 `OnAfterDeckChanged`（蓝图 `DrawTopCardFromDeck:12494`）。
+        Api.FireDeckChanged(side);
         FireSubAction("ZActionDrawCardFromDeck", new[]
         {
             ActionValue2.Int("cardID", card.CardId),
@@ -953,6 +1010,32 @@ public sealed class MatchEngine
                 ["cardPlayed"] = card,
             },
             broadcastName: true);
+
+        // ---- `SetRightLeftMostWhenPlayed`（蓝图 `BP_CardFunctions.g.cs:34430-34535`）----
+        //
+        // 蓝图那个函数在**打出时**给这张牌记两个 JSON 标记：
+        // <code>
+        // :34450  若 `card.locationNumber == 0`            ⇒ WasLeftMostWhenPlayedFromHandKey = true
+        // :34510  否则                                      ⇒ JSON_Clear(WasLeftMost…)
+        // :34518  若 `card.locationNumber == 手牌里最大号`  ⇒ WasRightMostWhenPlayedFromHandKey = true
+        // :34528  否则                                      ⇒ JSON_Clear(WasRightMost…)
+        // </code>
+        // 读取方是 `WasLeftMostCardWhenPlayedFromHand` / `WasRightMostCardWhenPlayedFromHand`
+        //（蓝图 `:37653-37698`，IR 里 **10 个调用点**，消费者 `card_unit_17th_infantry_brigade`
+        // 与 `card_event_repel_the_attack` 都在 22 局语料里）。
+        //
+        // ⚠️ `SetRightLeftMostWhenPlayed` 在 IR 里**直接调用点为 0** —— 它属于
+        //   "客户端在打牌流程里调"的那一类，所以落点必须在内核自己的打牌路径上，
+        //   而且必须在卡**离开手牌之前**（蓝图那两句 `GetCardsInHandBySide` 读的就是"还在手牌里"的此刻）。
+        // ⚠️ 蓝图对"不满足"走的是 `JSON_Clear`（删键），这里写 `false` ——
+        //   对读取方等价（`JsonGetBool` 在缺键与存 "0" 时都返回 false）。
+        if (card.Location == card.Owner.HandOf())
+        {
+            var handNow = State.Hand(card.Owner).ToList();
+            int greatestIndex = handNow.Count == 0 ? -1 : handNow.Max(x => x.LocationNumber);
+            Api.JsonSetBool(card, CardApi.LeftMostWhenPlayedFromHandKey, card.LocationNumber == 0);
+            Api.JsonSetBool(card, CardApi.RightMostWhenPlayedFromHandKey, card.LocationNumber == greatestIndex);
+        }
 
         // ---- ① 先离开手牌，再结算效果 ----
         //
@@ -1408,6 +1491,9 @@ public sealed class MatchEngine
         }
 
         State.AddKredits(unit.Owner, -unit.OperationCost);
+        // T68：蓝图 `MoveCardToFrontline` `:26998` 在付完油费之后调
+        // `ExecuteOnOperationKreditsSpent`。
+        Api.FireOperationKreditsSpent(unit, unit.OperationCost);
         unit.HasMovedThisTurn = true;
 
         RecordAction("XActionMoveCardToLine", unit.Owner, new Dictionary<string, object?>
@@ -1771,6 +1857,41 @@ public sealed class MatchEngine
             return false;
         }
 
+        // ---- ★★ T30 `OnOtherCardAttackSwitchTarget`（蓝图 `AttackCard` :4214-4308）----
+        //
+        // ⚠️ 顺序：蓝图里 **T30 轮（`:4214`）在 T31 轮（`:4338`）之前**，两者都排在扣油费
+        //   （`:4513`）之前 ⇒ 这一段必须在下面 T31 窗口**之前**、`State.AddKredits` 之前。
+        // ⚠️ 换完目标**不重做任何合法性判据**（蓝图如此）—— 所以上面那道 `AttackTargetGate`
+        //   校验的是**原目标**，这是刻意的、与蓝图一致。
+        var switchedDefender = Api.SwitchAttackTargetIfAny(attacker, defender);
+        if (!ReferenceEquals(switchedDefender, defender))
+        {
+            Say($"↪ 攻击目标被 T30 改成 {switchedDefender}（原 {defender}）");
+            defender = switchedDefender;
+        }
+
+        // ---- ★★ T31 `OnOtherCardAttacks` 反制窗口（蓝图 `AttackCard` :4334-4512）----
+        //
+        // ⚠️⚠️ **必须放在 `State.AddKredits` 之前**：蓝图这两段排在扣油费
+        //   （`:4513 ChangeKreditsBySide(-costToPay)`）**之前**，而 `stopAttack` 一旦为真
+        //   就直接 `:4510 success = True` → `:4512 return` —— **油费不扣**、
+        //   也不记"已攻击"（`SetAttackerHasAttacked` 只在 `ExecuteAttackCard` 与
+        //   `ExecuteStoppedAttack` 里被调）。放在扣费之后，这两条都会错。
+        //
+        // ⚠️ 20 张订阅者（`docs/card-ir.json` 的 **`locals`**，`entrypoints` 0 张）
+        //   —— 这就是 README §9.5 P1 说的那条"整条行为是死的"。
+        var intercept = Api.FireOtherCardAttacks(attacker, defender);
+        if (intercept.StopAttack)
+        {
+            // 蓝图 `:4487-4512`：`GetStopAttack()` 真 ⇒ `success = True` 后**什么都不做**。
+            // ⚠️ 返回值必须是 **true**（蓝图 `success = True`）：返回 false 在回放审计里
+            //   是"动作非法"，会把一次合法的"被反制掉"记成"内核拒绝了攻击"。
+            // ⚠️ 这条分支目前是**死代码**（20 张订阅卡的 `stopAttack` 写入全是字面量 false），
+            //   但机制必须留着 —— 它是唯一的"整条攻击作废"通道。
+            Say($"🛑 攻击被反制中止（stopAttack）：{attacker} → {defender}");
+            return true;
+        }
+
         State.AddKredits(attacker.Owner, -attacker.OperationCost);
         attacker.HasAttackedThisTurn = true;
         // 攻击额度 -1（蓝图 `SetAttackerHasAttacked`，`BP_CardFunctions.g.cs:33930-33942`：
@@ -1839,6 +1960,47 @@ public sealed class MatchEngine
         //    （与 `OnBeforeOtherCardPlayedFromHand` 同一个坑，见 `PlayCard` 里那段注释）。
         //    广播分支本身就排除主体，正好对上蓝图的 `item != _attackerCard`。
         Api.FireTrigger("OnBeforeOtherCardAttacks", attacker, attacker.Owner, broadcastName: true);
+
+        // ---- ★★ T31 第二半：`AttackedAndStopped` ⇒ 跳过**全部**伤害 ----
+        // 蓝图 `AttackCard`（`BP_CardFunctions.g.cs`）：
+        // <code>
+        // :4643  if (!tmpAttackedAndStopped) → :4656      ; 正常结算
+        // :4645  _defenderCard = Nothing;  :4647 damageToDefenderFinal = 0
+        // :4649  ExecuteStoppedAttack(self, _attackerCard)
+        //          → :17706 SetAttackerHasAttacked（本文件 1775/1780 已经做过，不重复）
+        //          → :17712 OnAttackStopped(attacker)     ; 订阅者 2 张
+        //          → :17714 NotifyStoppedAttack(cardID)   ; = ZActionStoppedAttack
+        // :4653  success = True
+        // </code>
+        // ⇒ 语义 =「**攻击已经发起**（油费与"已攻击"记账照做），**但没有发生战斗结算**」。
+        //   卡面互证：THE MERCHANT NAVY「Retreat it instead」/ BM-13N US6
+        //   「Retreat this unit **before damage is applied**」/ COUNTER STRIKE「destroy the unit」
+        //   / AIR DEFENSE 与 BEAUFIGHTER「attacker takes 3 damage first」
+        //   / TACTICAL RETREAT「send it to hand **before damage**」—— 正是写死 true 的那几张。
+        // ⚠️ 必须在这之前 return：`defender.HasBeenAttackedThisTurn = True` 在下面，
+        //   而蓝图里它属于 `ExecuteAttackCard`（`:12782`）⇒ 停止路**不设**它。
+        if (intercept.AttackedAndStopped)
+        {
+            Say($"✋ 攻击被中止（AttackedAndStopped）：{attacker} → {defender} 不结算伤害");
+            // `docs/对局协议参考.md`：`ZActionStoppedAttack` 的参数列为空 ⇒ 无参。
+            FireSubAction("ZActionStoppedAttack", Array.Empty<ActionValue2>());
+            // 蓝图 `:17712 OnAttackStopped(_attackerCard)`：订阅者 2 张
+            //（`card_unit_meteor` / `card_unit_salamander`，`docs/card-ir.json` 实测）。
+            // ⚠️ 事件载荷的确切变量名**未核实**（两者的入口都只是一个 jump 到 ubergraph）
+            //    ⇒ 先按 `eventArgs[0] = attacker` 发，跑通后按卡体实际读的变量名校正。
+            Api.FireTrigger("OnAttackStopped", attacker, attacker.Owner,
+                eventArgs: new object?[] { attacker });
+
+            // ---- T68 `OnOperationKreditsSpent`（蓝图 `:4651`）----
+            // ⚠️⚠️ **在攻击链上 T68 只在两条"提前返回"的分支发**，正常伤害路径**不发** ——
+            //   蓝图 `AttackCard` 全文只有两个调用点（`:4637` / `:4651`），
+            //   而正常结算从 `:4656 L_0EDF` 起、**没有**这个调用。
+            //   `:4651` 正是本条分支（`tmpAttackedAndStopped`），所以只能挂在这里。
+            //   ⇒ 把它挂到"正常扣油费之后"会是**多发**（每打一次都发）。
+            Api.FireOperationKreditsSpent(attacker, attacker.OperationCost);
+            CheckDeaths();
+            return true;
+        }
 
         bool shockAttack = attacker.Keywords.Contains(Keyword.Shock);
         bool ambushAttack = !defender.IsHq
@@ -2366,19 +2528,40 @@ public sealed class MatchEngine
         // ⇒ 一次 FireTrigger 同时覆盖"自己那一路"和"别人那一路"；
         //   被压制的卡**两个都不发**（旧实现无条件发 `OnBeforeDestroyed`）。
         // `DestroyedInCombat` 这个入参内核没有建模，恒传 false（近似，不猜）。
+        //
+        // ★★ **2026-10-04 更正：那道门只管"自己那一路"，广播是两条路都会到的。**
+        // 蓝图 `ref/kards-sim/KardsSim/Generated/BP_CardFunctions.g.cs` 原文：
+        // <code>
+        // :14833  if (!_cardDestroyed.isSuppressed) goto L_0208;  ; 未压制 ⇒ 跳去自程序
+        // :14835  L_00B0: FetchAllCardsWithEventTrigger(15)      ; ★ 广播：压制时**直落这里**
+        // :14874  L_0208: _cardDestroyed.OnBeforeDestroyed(…)    ; 自程序
+        // :14876          goto L_00B0                            ; ★ 自程序跑完**又跳回广播**
+        // </code>
+        // ⇒ **广播无条件发**；被压制的卡只是不发**自己的** `OnBeforeDestroyed`。
+        // ⚠️ 旧实现把两个名字包在同一个 `if` 里 ⇒ 被压制的卡被摧毁时**漏发 T15 广播**
+        //   （19 张订阅者里，那些只订阅 `OnBeforeOtherCardDestroyed` 的会整条死掉）。
+        // ⚠️ 旧注释把 `JumpIfNot(cond) -> T` **读反了** —— 它是「**cond 为假**才跳」，
+        //   不是「cond 为真 ⇒ 两个都不发」。
+        // ⚠️ `OnBeforeOtherCardDestroyed` 不以 `OnOther` 开头 ⇒ 必须显式
+        //   `broadcastName: true`（同一个坑见 `CardApi.FireTrigger` 的 `broadcastName` 注释）。
+        var destroyNamed = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["cardDestroyed"] = card,
+            ["attacker"] = destroyer,
+            ["TriggerNotDestroyed"] = false,
+            ["DestroyedInCombat"] = false,
+        };
+        var destroyArgs = new object?[] { card, destroyer, false, false };
+
         if (!card.Keywords.Contains(Keyword.Suppressed))
         {
-            Api.FireTrigger("OnBeforeDestroyed", card, card.Owner, "OnBeforeOtherCardDestroyed",
-                eventArgs: new object?[] { card, destroyer, false, false },
-                eventSubject: card,
-                namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-                {
-                    ["cardDestroyed"] = card,
-                    ["attacker"] = destroyer,
-                    ["TriggerNotDestroyed"] = false,
-                    ["DestroyedInCombat"] = false,
-                });
+            Api.FireTrigger("OnBeforeDestroyed", card, card.Owner,
+                eventArgs: destroyArgs, eventSubject: card, namedArgs: destroyNamed);
         }
+
+        Api.FireTrigger("OnBeforeOtherCardDestroyed", card, card.Owner,
+            broadcastName: true,
+            eventArgs: destroyArgs, eventSubject: card, namedArgs: destroyNamed);
 
         FireSubAction("ZActionDestroyUnit", new[]
         {

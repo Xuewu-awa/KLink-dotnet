@@ -536,7 +536,38 @@ public sealed class KismetVm
         }
 
         // 求值入参。输出槽位置传 null —— 它们不是输入。
-        var outSet = new HashSet<int>(step.OutParams);
+        //
+        // ★★ 2026-10-04：**推断被生成器漏掉的出参槽**。
+        //   IR 里有 **390 个 call 步骤** `outs` 为空、却把出参槽当成**实参**传在 `args` 里，
+        //   命名约定是 `CallFunc_<函数名>_<出参名>`（**大小写不保证一致**，例如
+        //   `SpawnCardOnBattlefield` → `CallFunc_SpawnCardonBattlefield_spawnedCardID`）。
+        //   实测分布：`SpawnCardInHandBySide` ×184 / `DrawCardsFromDeckBySide` ×150 /
+        //   `SpawnCardOnBattlefield` ×44 / `getHasGameplayTag` ×7 / `SpawnCardInDeckBySide` ×5。
+        //   ⇒ 不推断的话，凡消费 `spawnedCardID` / `cardsIDs` 的卡**一律拿到 null**
+        //     （实证：`card_event_cold_trap` 的 T30 体 `newDefender = GetCardFromID(spawnedCardID)`
+        //      恒为 null ⇒ 攻击目标永远换不掉）。
+        //   ⚠️ 只在 `outs` **为空**时推断：生成器已经标好的步骤一律不动。
+        var outParams = new List<int>(step.OutParams);
+        if (outParams.Count == 0 && fn.Length > 0)
+        {
+            string want = "CallFunc_" + fn;
+            for (int i = 0; i < step.Args.Count; i++)
+            {
+                if (step.Args[i].Var is string vn
+                    && vn.StartsWith(want, StringComparison.OrdinalIgnoreCase))
+                {
+                    outParams.Add(i);
+                    if (Environment.GetEnvironmentVariable("KLINK_TRACE_OUTSLOT") == "1")
+                    {
+                        Console.Error.WriteLine($"[OUTSLOT] {fn} -> args[{i}] {vn}");
+                    }
+
+                    break;   // 出参槽通常只有一个
+                }
+            }
+        }
+
+        var outSet = new HashSet<int>(outParams);
         var raw = new object?[step.Args.Count];
         SeedArrayTarget(fn, step.Args, frame);
         for (int i = 0; i < step.Args.Count; i++)
@@ -602,7 +633,7 @@ public sealed class KismetVm
         if (!handled && LocalProgramFor(ctx, fn) is { } local)
         {
             var outNames = new List<string>();
-            foreach (int p in step.OutParams)
+            foreach (int p in outParams)
             {
                 if (p < step.Args.Count && step.Args[p].Var is { } slot)
                 {
@@ -648,11 +679,11 @@ public sealed class KismetVm
         //   · `JSON_GetInt` 的第二个 out 同理
         // 约定：原语返回 `object?[]` 表示"按下标对应各 out 槽"；
         // 返回别的类型仍然只写第一个槽（普通单返回值）。
-        if (step.OutParams.Count > 1 && result is object?[] multi)
+        if (outParams.Count > 1 && result is object?[] multi)
         {
-            for (int i = 0; i < step.OutParams.Count; i++)
+            for (int i = 0; i < outParams.Count; i++)
             {
-                if (step.Args[step.OutParams[i]].Var is not { } slot)
+                if (step.Args[outParams[i]].Var is not { } slot)
                 {
                     continue;
                 }
@@ -660,15 +691,15 @@ public sealed class KismetVm
                 frame.Set(slot, i < multi.Length ? multi[i] : null);
             }
 
-            StepTrace?.Add($"      写入多输出 {string.Join(", ", step.OutParams.Select((p, i) =>
+            StepTrace?.Add($"      写入多输出 {string.Join(", ", outParams.Select((p, i) =>
                 $"{step.Args[p].Var}={((i < multi.Length ? multi[i] : null) ?? "null")}"))}");
             return;
         }
 
         // 把返回值写进第一个输出槽
-        if (step.OutParams.Count > 0 && result is not null)
+        if (outParams.Count > 0 && result is not null)
         {
-            var slotExpr = step.Args[step.OutParams[0]];
+            var slotExpr = step.Args[outParams[0]];
             if (slotExpr.Var is { } slot)
             {
                 frame.Set(slot, result);
@@ -682,7 +713,7 @@ public sealed class KismetVm
                 StepTrace?.Add($"      [!] {fn} 的输出槽不是变量: {slotExpr}");
             }
         }
-        else if (step.OutParams.Count > 0)
+        else if (outParams.Count > 0)
         {
             StepTrace?.Add($"      [!] {fn} 返回 null，输出槽未写入");
         }
