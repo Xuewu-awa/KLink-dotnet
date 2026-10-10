@@ -539,6 +539,7 @@ public sealed class KismetVm
         var outSet = new HashSet<int>(step.OutParams);
         var raw = new object?[step.Args.Count];
         SeedArrayTarget(fn, step.Args, frame);
+        SeedSetTarget(fn, step.Args, frame);
         for (int i = 0; i < step.Args.Count; i++)
         {
             raw[i] = outSet.Contains(i) ? null : Eval(step.Args[i], frame, ctx);
@@ -592,13 +593,10 @@ public sealed class KismetVm
         // 2. **出参名从调用点的 out 槽名反推**：蓝图里 out 槽叫 `CallFunc_<函数名>_<出参名>`
         //    （实测 `CallFunc_HasCustomAbilityFromCard_doesIt` → `doesIt`），
         //    于是把函数名前缀剥掉就是函数体里那个变量名。剥不出来就只跑副作用。
-        // 3. **入参不 seed**：dump 里**没有参数名**（`cards.full.json` 的函数项只有
-        //    `expr_count` + `bytecode`）。所以函数体只能靠帧默认值（`cardFunction` = `ctx.Self`、
-        //    `side`、`cardID`、实例变量）工作 —— 这正好覆盖这一族的主流形态
-        //    （实测 `ApplyBuff` 体读的是 `_tmp_card`(自身局部) / `side` / `cardFunction`；
-        //     `didPlayBritishInfantryLastTurn` 读 `side` / `cardFunction`）。
-        //    **需要真入参的私有函数会拿到 null**，这一点用 `<local-ran:名字>` 计数器留痕，
-        //    不假装它对 —— 要是回归数字恶化，就把这条兜底关掉。
+        // 3. **显式形参仍没有元数据**：dump 里没有参数名（`cards.full.json` 的函数项只有
+        //    `expr_count` + `bytecode`）。局部函数现在会继承调用方帧中的局部槽（例如
+        //    `_tmp_card`），覆盖绝大多数由调用方先写槽、再调用 helper 的形态；但需要
+        //    独立形参绑定的私有函数仍可能拿到 null，用 `<local-ran:名字>` 留痕。
         if (!handled && LocalProgramFor(ctx, fn) is { } local)
         {
             var outNames = new List<string>();
@@ -614,9 +612,17 @@ public sealed class KismetVm
                 }
             }
 
+            // A local function call executes in the caller's Blueprint frame.  In
+            // particular, private helpers such as Panzer III L's ApplyAttackBuff
+            // consume scratch locals (`_tmp_card`) populated immediately before
+            // the call.  Starting a fresh frame without those values silently
+            // turns the helper into a no-op.  Copy the current frame as the seed;
+            // the local program still gets its own frame, so writes do not leak
+            // back except through the engine state mutations they intentionally do.
+            var localSeed = frame.Snapshot();
             var bag = outNames.Count > 0
-                ? RunLocalProgramMulti(local, ctx, null, outNames.ToArray())
-                : RunLocalProgramMulti(local, ctx, null);
+                ? RunLocalProgramMulti(local, ctx, localSeed, outNames.ToArray())
+                : RunLocalProgramMulti(local, ctx, localSeed);
             result = outNames.Count > 0 ? bag[outNames[0]] : null;
             handled = true;
             _api.NotifyUnimplemented($"<local-ran:{fn}>");
@@ -628,6 +634,18 @@ public sealed class KismetVm
             _api.NotifyUnimplemented(fn);
             StepTrace?.Add($"      [!] {fn} 未实现");
             return;
+        }
+
+        // Standalone card functions lose the generated out-parameter metadata
+        // for SpawnCardOnBattlefield/SpawnCardInFrontline.  Their final argument
+        // is still the spawned-card-ID slot, so restore that write here.
+        if (step.OutParams.Count == 0
+            && fn is "SpawnCardOnBattlefield" or "SpawnCardInFrontline"
+            && result is CardInstance spawned
+            && step.Args.Count > 0
+            && step.Args[^1].Var is { } implicitOut)
+        {
+            frame.Set(implicitOut, spawned.CardId);
         }
 
         // 诊断开关关闭时不要插值（这是每次原语调用的必经之路）
@@ -720,6 +738,13 @@ public sealed class KismetVm
         "Array_Remove", "Array_RemoveItem", "Array_Set",
     };
 
+    // Blueprint TSet nodes mutate a local set by reference.  The IR omits the
+    // element type, so locally-created sets use HashSet<object?>.
+    private static readonly HashSet<string> InPlaceSetOps = new(StringComparer.Ordinal)
+    {
+        "Set_Add", "Set_Clear", "Set_Remove", "Set_RemoveItems", "Set_ToArray",
+    };
+
     private static void SeedArrayTarget(string fn, IReadOnlyList<KismetExpr> argExprs, Frame frame)
     {
         if (!InPlaceArrayOps.Contains(fn) || argExprs.Count == 0)
@@ -731,6 +756,20 @@ public sealed class KismetVm
         if (first.Var is { } name && first.Context is null && frame.Get(name) is null)
         {
             frame.Set(name, new List<CardInstance>());
+        }
+    }
+
+    private static void SeedSetTarget(string fn, IReadOnlyList<KismetExpr> argExprs, Frame frame)
+    {
+        if (!InPlaceSetOps.Contains(fn) || argExprs.Count == 0)
+        {
+            return;
+        }
+
+        KismetExpr first = argExprs[0];
+        if (first.Var is { } name && first.Context is null && frame.Get(name) is null)
+        {
+            frame.Set(name, frame.EnsureBlueprintSet(name) ?? new HashSet<object?>());
         }
     }
 
@@ -771,6 +810,7 @@ public sealed class KismetVm
         {
             // 同上：**不摘** `args[0]` 的 `{self:true}` —— 它是第一个实参。
             SeedArrayTarget(c, expr.Args, frame);
+            SeedSetTarget(c, expr.Args, frame);
             var callArgs = expr.Args.Select(a => Eval(a, frame, ctx)).ToArray();
             object? recv = expr.Context is not null ? Eval(expr.Context, frame, ctx) : null;
             var r = _api.InvokeByName(c, recv, callArgs, ctx, out bool handled);
@@ -971,10 +1011,11 @@ public sealed class KismetVm
             //   实测对局 773639 `#29 t7`：人类用雾战移除 bot 的 `card_unit_1st_airborne#60`，
             //   两张复制品应当进 **Right** 牌库，旧实现进了 Left。
             //
-            //   本内核没有建模「控制权转移」（`Side.Owner` 就是归属），
-            //   所以 `originalSide` 与 `side` 同值 —— 这是近似，不是猜：两者
-            //   在没有偷取/转换的对局里本来就相等。
-            "originalSide" => (int)card.Owner,
+            //   `CardInstance.OriginalOwner` 保留创建时归属；旧的手工测试卡
+            //   没有填该字段时才回退到当前归属。
+            "originalSide" => (int)(card.OriginalOwner is Side.Left or Side.Right
+                ? card.OriginalOwner : card.Owner),
+            "underEnemyControl" => card.UnderEnemyControl,
             "faction" => card.Definition.FactionId,
             "name" => card.Name,
             "cardID" => card.CardId,
@@ -984,6 +1025,7 @@ public sealed class KismetVm
             "defense" => card.Defense,
             "maxDefense" => card.MaxDefense,
             "enterPlayOnTurn" => card.EnteredPlayOnTurn,
+            "currentTarget" => card.CurrentTarget,
             // 「三选一」卡把自己选的分支存在卡的 `ChooseOne` 成员上再回读
             // （kardsim 注释里点名的例子：card_event_strategic_focus 用
             //  `Switch(GetMember(self,"ChooseOne"), [(0,IsGroundUnit),(1,IsAirUnit)])`）。
@@ -1034,7 +1076,7 @@ public sealed class KismetVm
             "friendlyAttacked" => "friendlyAttacked",
             "A6M2Effect" => "A6M2Effect",
 
-            _ => null,
+            _ => card.BlueprintSets.TryGetValue(member, out var set) ? set : null,
         };
     }
 
@@ -1184,7 +1226,16 @@ public sealed class KismetVm
             // sd_kfz_10_38 / winter_regiment），全是这一族。
             if (bare is "instigatorID" or "instigatorId")
             {
-                return _ctx.EventArg(argIndex) ?? _ctx.Self?.CardId ?? 0;
+                // 事件桩的槽位后缀不是稳定的参数下标；广播方提供具名载荷时，
+                // 必须优先按 `instigatorID` 取值。没有具名载荷的旧事件再回退
+                // 到位置参数，最后才使用当前执行卡作为兼容兜底。
+                return (_ctx.NamedArgs.Count > 0
+                        && _ctx.NamedArgs.TryGetValue(bare, out var namedInstigator)
+                        ? namedInstigator
+                        : null)
+                       ?? _ctx.EventArg(argIndex)
+                       ?? _ctx.Self?.CardId
+                       ?? 0;
             }
 
             // ⚠️ 具名载荷**优先于**位置推断，而且必须排在下面那条 `…ID ⇒ 事件主体` 之前。
@@ -1229,10 +1280,12 @@ public sealed class KismetVm
                 case "spawnedSide":
                 case "side":
                 case "sideGaining":
+                    // 阵营类入参：优先使用按名字传入的载荷，再回退到位置参数。
+                    return _ctx.EventArg(argIndex) ?? (int?)(subject?.Owner ?? _ctx.Controller);
                 case "isNegativeGain":
-                    // 阵营类入参：派发方按事件语义放进 EventArgs；
-                    // 拿不到就退回「事件主体所属阵营」。
-                    return _ctx.EventArg(argIndex) ?? (int?)(subject?.Owner ?? _ctx.Controller);                case "method":
+                    // 这是独立的布尔入参，不能套用阵营的默认值。
+                    return _ctx.EventArg(argIndex);
+                case "method":
                 case "StartOfTurnDraw":
                     return _ctx.EventArg(argIndex);
             }
@@ -1252,7 +1305,12 @@ public sealed class KismetVm
             }
 
             var eventSubject = _ctx.Trigger ?? _ctx.Target;
-            return eventSubject ?? _ctx.Self;
+
+            // 事件变量没有主体时必须保持 null。把它兜底成 Self 会把「无目标」
+            // 误解成「效果卡自己」，尤其会让 IsValid(K2Node_Event_targetCard)
+            // 这类守卫错误放行。真正的隐式 self 只由 Frame 的已知槽位提供；
+            // 这里处理的是事件入参，不能再猜一个卡实例。
+            return eventSubject;
         }
 
         public void Set(string name, object? value)
@@ -1262,6 +1320,26 @@ public sealed class KismetVm
                 _locals[name] = value;
             }
         }
+
+        public HashSet<object?>? EnsureBlueprintSet(string name)
+        {
+            if (_ctx.Self is not { } self || name != "pinned_units_with_override")
+            {
+                return null;
+            }
+
+            if (!self.BlueprintSets.TryGetValue(name, out var set))
+            {
+                set = new HashSet<object?>();
+                self.BlueprintSets[name] = set;
+            }
+
+            return set;
+        }
+
+        /// <summary>复制当前 Blueprint 帧，供卡内私有函数调用继承调用方局部槽。</summary>
+        public IReadOnlyDictionary<string, object?> Snapshot()
+            => new Dictionary<string, object?>(_locals, StringComparer.Ordinal);
 
         public void SetOutSlot(KismetStep step, object? value)
         {

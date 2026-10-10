@@ -6,40 +6,37 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <RootNamespace>KLink.Bot</RootNamespace>
+    <!-- The standalone simulator is the rule/data source for this host repository. -->
+    <BotDataRoot Condition="'$(BotDataRoot)' == ''">$(MSBuildProjectDirectory)\..\klink bot</BotDataRoot>
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- 卡牌数据：优先用线上 pak 的 CDO 权威版（tools/gen-card-db.py 生成，覆盖全部线上卡），
-         回退到较早的 FModel 导出（缺 34 张线上已有的卡）。 -->
-    <None Include="..\..\klink bot\docs\cards.live.json" Link="Data\cards.json"
-          CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\..\klink bot\docs\cards.live.json')" />
-    <None Include="..\..\tem\cards-from-fmodel.json" Link="Data\cards.json"
-          CopyToOutputDirectory="PreserveNewest" Condition="!Exists('..\..\klink bot\docs\cards.live.json')" />
-
-    <None Include="..\..\klink bot\docs\card-effects.json" Link="Data\card-effects.json"
-          CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\..\klink bot\docs\card-effects.json')" />
+    <!-- 卡牌数据来自独立模拟器的线上 pak CDO 导出。 -->
+    <None Include="$(BotDataRoot)\docs\cards.live.json" Link="Data\cards.json"
+          CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(BotDataRoot)\docs\cards.live.json')" />
+    <None Include="$(BotDataRoot)\docs\card-effects.json" Link="Data\card-effects.json"
+          CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(BotDataRoot)\docs\card-effects.json')" />
 
     <!-- Blueprint 字节码 IR：由 tools/gen-kismet-ir.py 生成，Kismet 解释器直接执行它。
          这是效果编排层的真正来源（覆盖 1636 张有蓝图的卡）。 -->
-    <None Include="..\..\klink bot\docs\card-ir.json" Link="Data\card-ir.json"
-          CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\..\klink bot\docs\card-ir.json')" />
+    <None Include="$(BotDataRoot)\docs\card-ir.json" Link="Data\card-ir.json"
+          CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(BotDataRoot)\docs\card-ir.json')" />
 
     <!-- 真实对局的线路动作（tools/extract-live-actions.py 从 fyserver 日志抽出）。
          用于校验协议理解；将来接逐帧状态对拍。 -->
-    <None Include="..\..\klink bot\docs\live-actions.json" Link="Data\live-actions.json"
-          CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\..\klink bot\docs\live-actions.json')" />
+    <None Include="$(BotDataRoot)\docs\live-actions.json" Link="Data\live-actions.json"
+          CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(BotDataRoot)\docs\live-actions.json')" />
 
     <!-- 真实对局回放（fyserver 只读接口导出）：开局快照 + 全部动作。
          内核验证的主素材，见 tools/decode-replay.py 与 src/KLink.Bot/Replay/。 -->
-    <None Include="..\..\klink bot\docs\live-replays\*.json" Link="Data\live-replays\%(Filename)%(Extension)"
-          CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\..\klink bot\docs\live-replays')" />
+    <None Include="$(BotDataRoot)\docs\live-replays\*.json" Link="Data\live-replays\%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(BotDataRoot)\docs\live-replays')" />
 
     <!-- 卡组码表：优先用线上 pak 解出的权威版本（tools/convert-deckcode-table.py 生成），
          比 Assets/kards-server/deck_code_ids.json 新（含 E*/D* 新卡）。 -->
-    <None Include="..\..\klink bot\docs\deck_code_ids.live.json" Link="Data\deck_code_ids.json"
-          CopyToOutputDirectory="PreserveNewest" Condition="Exists('..\..\klink bot\docs\deck_code_ids.live.json')" />
-    <None Include="..\KLink.Server\Assets\kards-server\deck_code_ids.json" Link="Data\deck_code_ids.json"
-          CopyToOutputDirectory="PreserveNewest" Condition="!Exists('..\..\klink bot\docs\deck_code_ids.live.json')" />
+    <None Include="$(BotDataRoot)\docs\deck_code_ids.live.json" Link="Data\deck_code_ids.json"
+          CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(BotDataRoot)\docs\deck_code_ids.live.json')" />
+    <!-- Do not add the legacy object-shaped table: the live table above is authoritative. -->
   </ItemGroup>
 
 </Project>

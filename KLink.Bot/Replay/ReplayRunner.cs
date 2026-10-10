@@ -29,6 +29,7 @@ namespace KLink.Bot.Replay;
 public sealed class ReplayRunner
 {
     private readonly CardDatabase _db;
+    private readonly Dictionary<int, CardInstance> _cardAliases = new();
 
     public ReplayRunner(CardDatabase db) => _db = db;
 
@@ -322,6 +323,7 @@ public sealed class ReplayRunner
     /// </param>
     public Report Run(ReplayData replay, bool verbose, Action<WireAction, GameState>? onStepped)
     {
+        _cardAliases.Clear();
         // ---- 1) 卡池：快照里每个 cardID 都是唯一的，直接全建成「牌库」，
         //         真正需要时再按需注入手牌（见类注释的保真度缺口 1） ----
         var engine = new MatchEngine(_db, Array.Empty<string>(), Array.Empty<string>(),
@@ -658,6 +660,16 @@ public sealed class ReplayRunner
         {
             int turn = a.TurnNumber;
             Side side = replay.SideOf(a.PlayerId);
+
+            // 回合标记自带客户端写入的 side。它比服务端转发的 player_id 更可靠；
+            // PC/ML/AC 等动作没有该字段时仍沿用 player_id 推断。
+            if (a.ActionType is "XActionStartOfTurn" or "XActionEndOfTurn"
+                && SideFromWire(a.Get("side")) is { } explicitSide
+                && explicitSide != Side.NotAvailable)
+            {
+                side = explicitSide;
+            }
+
             string sideStr = side.ToWire() is { Length: > 0 } s ? s : "?";
 
             // 动作结算**前**采样对手 HQ
@@ -852,8 +864,19 @@ public sealed class ReplayRunner
 
                             if (card.Location != side.HandOf())
                             {
+                                bool cameFromDeck = card.Location is CardLocation.DeckLeft
+                                    or CardLocation.DeckRight;
                                 state.Move(card, side.HandOf());
                                 injected++;
+
+                                // 动作流引用的牌可能已经在客户端正常抽到手里，而本地牌序
+                                // 不同导致它仍在牌库。补进手牌时也要补发抽牌触发，
+                                // 否则光环减费与 OnCardDrawnFromDeck 效果会整条缺失。
+                                if (cameFromDeck)
+                                {
+                                    engine.FireEnteredHandFromDeckEvents(card, side,
+                                        startOfTurnDraw: false);
+                                }
                             }
 
                             var target = a.TargetId > 0 ? state.ById(a.TargetId) : null;
@@ -1170,6 +1193,13 @@ public sealed class ReplayRunner
     /// 键位：<c>0</c>=命令名，<c>1</c>=目标阵营，<c>2</c>=参数，<c>3</c>=目标区域。
     /// 目前实测到 <c>SetKredits</c> 与 <c>SpawnCard</c> 两条。
     /// </summary>
+    private static Side SideFromWire(string? raw) => raw switch
+    {
+        "left" => Side.Left,
+        "right" => Side.Right,
+        _ => Side.NotAvailable,
+    };
+
     private bool ApplyCheat(WireAction a, Side fallbackSide, GameState state, ref string? failure)
     {
         string op = a.Get("0") ?? "";
@@ -1502,10 +1532,29 @@ public sealed class ReplayRunner
             return existing;
         }
 
+        if (_cardAliases.TryGetValue(a.CardId, out var aliased))
+        {
+            return aliased;
+        }
+
         string? name = NameOf(a, replay, 0) ?? NameOf(a, replay, 1);
         if (name is null)
         {
             return null;
+        }
+
+        // Some replay streams renumber an effect-generated card between its creation and
+        // later actions. Reuse only an unambiguous same-owner, same-definition instance.
+        var aliases = state.Cards(owner)
+            .Where(c => c.CardId != a.CardId
+                && c.Name == name
+                && state.GeneratedCardIds.Contains(c.CardId)
+                && !_cardAliases.Values.Contains(c))
+            .ToArray();
+        if (aliases.Length == 1)
+        {
+            _cardAliases[a.CardId] = aliases[0];
+            return aliases[0];
         }
 
         // 归属：PC/ML/AC 的 0 号键都是行动方自己的卡
@@ -1549,6 +1598,11 @@ public sealed class ReplayRunner
         if (state.ById(a.SecondId) is { } existing)
         {
             return existing;
+        }
+
+        if (_cardAliases.TryGetValue(a.SecondId, out var aliased))
+        {
+            return aliased;
         }
 
         string? name = NameOf(a, replay, 1);

@@ -18,6 +18,11 @@ namespace KLink.Bot.Engine;
 /// </summary>
 public sealed class MatchEngine
 {
+    private int _effectResolutionDepth;
+    private bool _processingForcedEndTurn;
+    private Side? _pendingForcedEndTurnSide;
+    private int _pendingForcedEndTurnInstigator;
+
     /// <summary>HQ 初始防御。依据：fyserver 注入的 bot 动作里出现 <c>{"side":"right","75":"20"}</c>。</summary>
     public const int InitialHqDefense = 20;
 
@@ -92,7 +97,24 @@ public sealed class MatchEngine
         // ⚠️ 开局摆牌阶段发这些事件是**无害**的：`CardApi.FireTrigger` 的快照只含
         //    「双方棋盘 + 弃牌堆」，那时两者都是空的（HQ 不算棋盘卡），所以没有人收到。
         State.CardMoved = FireLocationMoved;
-        State.CardCreated = card => Api.FireTrigger("OnCreateCard", card, card.Owner);
+        State.CardCreated = FireCardCreated;
+    }
+
+    /// <summary>
+    /// 创建卡对象时先通知新卡自身，再通知订阅「其它卡被创建」的卡。
+    /// `OnOtherCardCreatedAlterCard` 是独立的广播触发点（T35），不能依赖
+    /// `OnCreateCard` 的主体派发自动覆盖。
+    /// </summary>
+    private void FireCardCreated(CardInstance card)
+    {
+        Api.FireTrigger("OnCreateCard", card, card.Owner);
+        Api.FireTrigger("OnOtherCardCreatedAlterCard", card, card.Owner,
+            eventArgs: new object?[] { card, 3 }, eventSubject: card,
+            namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
+            {
+                ["cardPlayed"] = card,
+                ["method"] = 3,
+            });
     }
 
     /// <summary>
@@ -115,14 +137,15 @@ public sealed class MatchEngine
     ///    本内核**没有建模这张枚举表**，一律传空串 —— 这是近似，不是复刻。
     ///    影响面：`MoveReason` 的订阅者（读它的卡）会拿到空串。
     /// </summary>
-    private void FireLocationMoved(CardInstance card, CardLocation oldLocation, CardLocation newLocation)
+    private void FireLocationMoved(CardInstance card, CardLocation oldLocation,
+                                   CardLocation newLocation, bool changeOwner)
     {
         var named = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             ["cardMoved"] = card,
             ["oldLocation"] = (int)oldLocation,
             ["newLocation"] = (int)newLocation,
-            ["ChangeOwner"] = false,
+            ["ChangeOwner"] = changeOwner,
             ["MoveReason"] = "",
         };
 
@@ -146,11 +169,26 @@ public sealed class MatchEngine
         }
 
         Api.FireTrigger("OnCardLocationMoved", card, card.Owner, "OnOtherCardLocationMoved",
-            eventArgs: new object?[] { card, (int)oldLocation, (int)newLocation, false, "" },
+            eventArgs: new object?[] { card, (int)oldLocation, (int)newLocation, changeOwner, "" },
             eventSubject: card,
             namedArgs: named,
             oldLocation: oldLocation,
             newLocation: newLocation);
+
+        // T49：前线单位离开前线时的专用事件。它与通用换区事件并列，
+        // 只在 oldLocation == BoardFrontline 时触发，避免退回半场/手牌的
+        // 单位被重复解释为“从前线离开”。
+        if (oldLocation == CardLocation.BoardFrontline)
+        {
+            Api.FireTrigger("OnMoveFromFrontline", card, card.Owner,
+                "OnOtherCardMoveFromFrontline",
+                eventArgs: new object?[] { card },
+                eventSubject: card,
+                namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
+                {
+                    ["cardMoved"] = card,
+                });
+        }
 
         // ---- 前线归属重算（P0，2026-10-01 实测 replay-214436）----
         //
@@ -195,6 +233,38 @@ public sealed class MatchEngine
         {
             RefreshFrontlineOwner(card);
         }
+    }
+
+    /// <summary>
+    /// Public adapter for Blueprint `ExecuteOnCardLocationMoved` callers that
+    /// perform a logical reveal without changing the card's stored location.
+    /// </summary>
+    public void ExecuteOnCardLocationMoved(CardInstance card, CardLocation oldLocation,
+                                           CardLocation newLocation, bool changeOwner = false)
+    {
+        var args = new object?[] { card, (int)oldLocation, (int)newLocation, changeOwner, "" };
+        var named = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["cardMoved"] = card,
+            ["oldLocation"] = (int)oldLocation,
+            ["newLocation"] = (int)newLocation,
+            ["ChangeOwner"] = changeOwner,
+            ["MoveReason"] = "",
+        };
+
+        if (!card.IsSuppressed)
+        {
+            Api.FireTrigger("OnCardLocationMoved", card, card.Owner,
+                eventArgs: args, eventSubject: card, namedArgs: named,
+                oldLocation: oldLocation, newLocation: newLocation);
+        }
+
+        // The Blueprint's observer loop follows the subject hook.  A
+        // suppressed card skips only its own hook but still reaches observers.
+        Api.FireTrigger("OnOtherCardLocationMoved", card, card.Owner,
+            eventArgs: args, eventSubject: card, namedArgs: named,
+            oldLocation: oldLocation, newLocation: newLocation,
+            broadcastName: true);
     }
 
     public GameState State { get; }
@@ -449,9 +519,24 @@ public sealed class MatchEngine
     /// </param>
     public void StartTurn(Side side, bool? draw = null)
     {
+        BeginEffectResolution();
+        try
+        {
+            StartTurnCore(side, draw);
+        }
+        finally
+        {
+            EndEffectResolution();
+        }
+    }
+
+    private void StartTurnCore(Side side, bool? draw = null)
+    {
         bool doDraw = draw ?? (State.Turn != 1);
 
         State.ActiveSide = side;
+        State.ResetTurnGameplayCounters();
+        State.ResetDestroyedThisTurn();
 
         // ---- kredit 槽位 +1，并回满 ----
         //
@@ -466,8 +551,9 @@ public sealed class MatchEngine
         // `the_war_machine` 抬到 13，下一回合被我们吃回 12；到 t21 真实槽位已 21、
         // 我们只算 12 ⇒ 人类打得出的牌我们打不出 ⇒ 从 t21 起动作接连失败。
         //
-        // ★★ **已定案（2026-10-02）：自然增长是「自己每一个回合 +1」，不是「全局回合号」。**
-        // 下面这段（只给**行动方** +1）就是正确实现，**不要再改**。
+        // ★★ 线上 pak 的 `BP_Logic::StartTurnBySide` 直接读取当前
+        // `getKreditSlotBySide`，满足条件时加 1，再用同一个新值同时写回
+        // kredit 与 kredit slot；这里不能维护一个隐藏的生命周期槽位基线。
         //
         // ---- 证据 1（权威）：真人玩家给出的规则描述 ----
         // 逐字引用（问的就是"槽位到底怎么涨"）：
@@ -482,9 +568,8 @@ public sealed class MatchEngine
         // ⇒ 「我第 1 个自己回合 = 1」「对面第 1 个自己回合**也** = 1」
         //   「我第 2 个自己回合 = 2」「对面第 2 个自己回合**也** = 2」
         //   「战争机器 +1 → 3」「**我的**下个回合自然增长 → 4」。
-        //   即 **槽位 = 自己第几个回合（+ 卡牌效果的额外槽）**，与 `State.Turn` 无关。
-        //   顺带确认了下面这段的两个细节：回满发生在**每个自己回合开始时**，
-        //   且卡牌效果抬上去的槽位**参与**下一次自然增长（3 → 4）。
+        //   即正常情况下每个自己的回合开始时当前槽位 +1；卡牌效果抬高的
+        //   当前槽位也会参与下一次增长（3 → 4），但降槽后的 3 也只能恢复到 4。
         //
         // ---- 证据 2（重算的花费表，**实际支付**口径）----
         // 工具：`tools/ServerBridgeTest --kredit-table`（成本取内核
@@ -542,7 +627,8 @@ public sealed class MatchEngine
         // 人类 t11 的真实支出是 `ML fifth_ohio 1 + land_girls 2 + p40_warhawk 3 + ML 2nd_west_africa 1 = 7`，
         // 而"自己第 6 回合 + 战争机器 1 = 7" —— **正好花光，一分不差**。
         // 内核多算的那 2 点油费（3 vs 1）把它挤成了 2，于是最后那张 3 费牌打不出来。
-        int slots = State.MaxKredits(side);
+        int previousSlots = State.MaxKredits(side);
+        int slots = previousSlots;
         if (!State.HasGameplayRestriction(side,
                 GameplayRestrictionType.CannotKreditSlotAtTurnStart)
             && slots < NaturalKreditCap)
@@ -551,6 +637,9 @@ public sealed class MatchEngine
         }
 
         State.SetMaxKredits(side, Math.Min(MaxKreditCap, slots));
+        // BP_Logic::StartTurnBySide calls SetKreditsAndKreditSlots with the
+        // same new slot value for both kredit and slot.  A temporary kredit
+        // bonus therefore does not survive the next start-of-turn refill.
         State.SetKredits(side, State.MaxKredits(side));
         State.DecrementGameplayRestrictions();
 
@@ -613,15 +702,22 @@ public sealed class MatchEngine
 
     public void EndTurn(Side side)
     {
-        Api.FireTrigger("OnEndOfTurn", null, side, "OnOtherEndOfTurn",
-            eventArgs: new object?[] { State.Turn });
+        BeginEffectResolution();
+        try
+        {
+            EndTurnCore(side);
+        }
+        finally
+        {
+            EndEffectResolution();
+        }
+    }
 
-        // 「到回合结束为止」的修正在这里撤销 —— 对应
-        // `BP_CardFunctions.RemoveBuffsEndOfTurn`（71 条语句），由
-        // `ExecuteEndOfTurnEvents` 在广播完 `OnEndOfTurn` 之后调用。
-        // 顺序要紧：卡自己的收尾逻辑（例如 `OnEndOfTurn` 里再读一次当前攻击力）
-        // 必须看到**还没撤销**的值。
-        Api.RemoveTemporaryBuffs();
+    private void EndTurnCore(Side side)
+    {
+        // Blueprint ExecuteEndOfTurnEvents owns the complete queue, including
+        // endofturn1/endofturn2 ordering and recursive subscribers.
+        Api.ExecuteEndOfTurnEvents();
 
         // ★★ 抑制（Suppress）**永不解除** ⇒ 这里**没有**任何清理（2026-10-02 第三轮删除）。
         //
@@ -664,6 +760,66 @@ public sealed class MatchEngine
 
         State.Turn++;
         StartTurn(side.Opposite());
+    }
+
+    /// <summary>
+    /// Marks the current effect chain for a deferred ForceEndTurn request.
+    /// The blueprint notifier is deliberately asynchronous from the headless
+    /// engine's point of view: the current VM/trigger program must return first.
+    /// </summary>
+    internal void RequestForceEndTurn(Side side, int instigatorID)
+    {
+        if (_pendingForcedEndTurnSide is null)
+        {
+            _pendingForcedEndTurnSide = side;
+            _pendingForcedEndTurnInstigator = instigatorID;
+        }
+    }
+
+    internal void BeginEffectResolution()
+        => _effectResolutionDepth++;
+
+    internal void EndEffectResolution()
+    {
+        if (_effectResolutionDepth <= 0)
+        {
+            return;
+        }
+
+        _effectResolutionDepth--;
+        if (_effectResolutionDepth == 0)
+        {
+            ConsumePendingForcedEndTurn();
+        }
+    }
+
+    private void ConsumePendingForcedEndTurn()
+    {
+        if (_processingForcedEndTurn
+            || _pendingForcedEndTurnSide is not { } side)
+        {
+            return;
+        }
+
+        int instigatorID = _pendingForcedEndTurnInstigator;
+        _pendingForcedEndTurnSide = null;
+        _pendingForcedEndTurnInstigator = 0;
+
+        FireSubAction("ZActionForceEndTurn", new[]
+        {
+            ActionValue2.Int("instigatorID", instigatorID),
+        });
+
+        _processingForcedEndTurn = true;
+        try
+        {
+            EndTurn(side);
+        }
+        finally
+        {
+            _processingForcedEndTurn = false;
+            ConsumePendingForcedEndTurn();
+        }
     }
 
     // ==================== 抽牌 ====================
@@ -756,6 +912,17 @@ public sealed class MatchEngine
         // `broadcast` 判定（`programName.StartsWith("OnOther")`）会**把主体自己排除**，
         // 兜底那一段又被 `subjectBroadcast` 挡住 ⇒ 22 张订阅 `OnCardDrawnFromDeck`
         // 的卡永远收不到（`card_event_guarilla_warfare_school` 这类"抽到牌时"效果全死）。
+        FireEnteredHandFromDeckEvents(card, side, startOfTurnDraw);
+        return card;
+    }
+
+    /// <summary>
+    /// 派发一张牌从牌库进入手牌时的两个客户端触发点。
+    /// 回放驱动在牌序不一致时也会把动作引用的牌从牌库硬塞进手牌，
+    /// 那条路径必须复用同一组事件，否则手牌光环和抽牌触发会缺失。
+    /// </summary>
+    public void FireEnteredHandFromDeckEvents(CardInstance card, Side side, bool startOfTurnDraw)
+    {
         var drawnNamed = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             ["drawnCardID"] = card.CardId,
@@ -770,7 +937,6 @@ public sealed class MatchEngine
         Api.FireTrigger("OnOtherCardDrawnFromDeck", card, side,
             eventArgs: new object?[] { card.CardId, startOfTurnDraw, (int)side },
             eventSubject: card, namedArgs: drawnNamed);
-        return card;
     }
 
     // ==================== 部署 ====================
@@ -903,28 +1069,82 @@ public sealed class MatchEngine
             return false;
         }
 
-        State.AddKredits(card.Owner, -card.KreditCost);
+        return PlayCardFromHandCore(card, target, skipLeaveTrigger,
+            chargeKredits: true, recordAction: true,
+            toFrontline: false, locationNumber: -1, instigatorID: card.CardId);
+    }
+
+    /// <summary>
+    /// 蓝图 <c>PlayCardDirectlyFromHand</c> 的免费/特殊出牌路径。
+    ///
+    /// 这条原语不经过普通出牌的行动方、费用和半场容量门；调用方可能正在
+    /// 结算另一张牌，甚至直接打出另一方手牌中的牌。它仍然复用完整的
+    /// CardPlayedFromHand 触发链，保证战吼、旁观触发、部署倍增、Alpine 和
+    /// 死亡检查的顺序与普通出牌一致。
+    /// </summary>
+    public bool PlayCardDirectlyFromHand(CardInstance card, bool toFrontline,
+                                         int instigatorID, int locationNumber)
+    {
+        if (card.Location != card.Owner.HandOf() || !card.IsAlive)
+        {
+            return false;
+        }
+
+        return PlayCardFromHandCore(card, target: null, skipLeaveTrigger: false,
+            chargeKredits: false, recordAction: false, toFrontline,
+            locationNumber, instigatorID);
+    }
+
+    private bool PlayCardFromHandCore(CardInstance card, CardInstance? target,
+                                      bool skipLeaveTrigger, bool chargeKredits,
+                                      bool recordAction, bool toFrontline,
+                                      int locationNumber, int instigatorID)
+    {
+        BeginEffectResolution();
+        try
+        {
+            return PlayCardFromHandCoreImpl(card, target, skipLeaveTrigger, chargeKredits,
+                recordAction, toFrontline, locationNumber, instigatorID);
+        }
+        finally
+        {
+            EndEffectResolution();
+        }
+    }
+
+    private bool PlayCardFromHandCoreImpl(CardInstance card, CardInstance? target,
+                                          bool skipLeaveTrigger, bool chargeKredits,
+                                          bool recordAction, bool toFrontline,
+                                          int locationNumber, int instigatorID)
+    {
+        if (chargeKredits)
+        {
+            State.AddKredits(card.Owner, -card.KreditCost);
+        }
 
         // PlayCardDirectlyFromHand in BP_CardFunctions assigns activation
         // numbers to Gotcha cards before the play broadcast. Normal play and
         // direct play share the same activation state in the client.
         Api.AssignGotchaActivatedOnPlayFromHand(card);
 
-        RecordAction("XActionPlayCardFromHand", card.Owner, new Dictionary<string, object?>
+        if (recordAction)
         {
-            ["cardID"] = card.CardId,
-            ["location"] = "Hand",
-            ["side"] = card.Owner.ToWire(),
-        });
+            RecordAction("XActionPlayCardFromHand", card.Owner, new Dictionary<string, object?>
+            {
+                ["cardID"] = card.CardId,
+                ["location"] = "Hand",
+                ["side"] = card.Owner.ToWire(),
+            });
 
-        FireSubAction(card.Definition.IsUnit || card.Definition.IsLocationCard
-            ? "ZActionPlayCardFromHand"
-            : "ZActionPlayOrderCardFromHand", new[]
-        {
-            ActionValue2.Int("instigatorID", card.CardId),
-            ActionValue2.Int("targetCardID", target?.CardId ?? 0),
-            ActionValue2.Int("playedDirectly", 1),
-        });
+            FireSubAction(card.Definition.IsUnit || card.Definition.IsLocationCard
+                ? "ZActionPlayCardFromHand"
+                : "ZActionPlayOrderCardFromHand", new[]
+            {
+                ActionValue2.Int("instigatorID", instigatorID),
+                ActionValue2.Int("targetCardID", target?.CardId ?? 0),
+                ActionValue2.Int("playedDirectly", 1),
+            });
+        }
 
         if (!skipLeaveTrigger && card.Location.IsBoard())
         {
@@ -972,7 +1192,7 @@ public sealed class MatchEngine
         //        对指令也成立），「先结算后离手」时判据必然为假 → 永不还原。
         if (card.Definition.IsUnit || card.Definition.IsLocationCard)
         {
-            PlaceOnBoard(card);
+            PlaceOnBoard(card, toFrontline, locationNumber);
         }
         else
         {
@@ -994,6 +1214,11 @@ public sealed class MatchEngine
         // 「本回合第一张指令打完了没有」的判据，而 `OnEnterPlay` 是**刚打出的这张**
         // 自己的进场时机 —— 它自己当然算"已经打出"。
         State.CardsPlayedThisTurn.Add(card);
+
+        // Blueprint trigger queries materialize their recipient lists before
+        // the played card's own effect. Keep that membership stable even
+        // while retaining the replay-validated dispatch timing below.
+        var playedCardTriggerSnapshot = Api.CaptureTriggerSnapshot();
 
         // ---- ③ 进场触发点（**只发这张卡自己的 `OnEnterPlay`**）----
         //
@@ -1019,18 +1244,19 @@ public sealed class MatchEngine
         // card_event_committed_crew 的 OnOtherCardPlayedFromHand 分支
         // （就是它们还原 buff / 给部署单位加成的那一支）从来没执行过。
         //
-        // ⚠️⚠️ **顺序：必须在下面 `RunDeploymentEffect` 之前**（2026-10-02 修正）。
+        // ⚠️⚠️ **接收者必须在前面快照；当前回放验证过的广播时序仍在
+        //    `RunDeploymentEffect` 之前**。
         //
         // 蓝图 `BP_CardFunctions.g.cs:5827 CardPlayedFromHand` 的语句序是：
         //   :6060  取触发点 51（`OnOtherCardPlayedFromHand`，`Core/Trigger.g.cs:61`）
-        //   :6142  **广播**它
-        //   :6388/:6396/:6412  才跑**这张卡自己的** `OnPlayedFromHand`
-        // ⇒ **广播在前、自身效果在后**。参考实现同序：
+        //   :6142  记录这批接收者；偏移顺序与回放行为目前尚未闭合。
+        // 当前内核保留回放验证过的「广播 → 自身效果」顺序，同时使用早快照。
         //   `ref/kards-sim/KardsSim/Bridge/GameEngine.Actions.cs:429 FirePlayTriggers(c)`
         //   在 `:448 Host.PlayCardFromHand(c, …)` **之前**
         //   （`GameEngine.Triggers.cs:50` 注明「顺序照客户端 `CardPlayedFromHand` 的编排」）。
         //
-        // 旧实现把这两步**反了**。后果实测（回放 854099 `#49 t11`，人类打 `card_event_night_raid`）：
+        // 旧实现虽然曾把广播提前，但没有保留早快照；动态扫描会让新生成卡错误收到本次广播。
+        // 后果实测（回放 854099 `#49 t11`，人类打 `card_event_night_raid`）：
         //   该指令的效果 `SpawnCardOnBattlefield(…, "card_unit_commandos", …)` 生成 `#11002` 到半场；
         //   因为广播排在后面，**这个刚生成的单位已经落场**，于是收到了本该只发给"**别人**"的广播
         //   —— 它自己的 `OnOtherCardPlayedFromHand`（`card_unit_commandos.g.cs:36-59`：
@@ -1042,9 +1268,6 @@ public sealed class MatchEngine
         //   ⇒ **客户端 `#39` 死、内核 `#39` 活** ⇒ 内核半场虚高 1
         //   ⇒ `#70 t15` 假「半场已满」（`#77/#79/#83/#90/#92/#102/#104/#109/#111/#116` 全是连锁）；
         //   随机游标也从 `#49` 起超前 1（审计 ④ 首条人类 HQ 失配 `#60 t13 期望 19 实际 20`）。
-        using var playedBroadcast = Api.BeginPlayedCardBroadcast(card.CardId);
-        Api.FireTrigger("OnOtherCardPlayedFromHand", card, card.Owner, eventArgs: new object?[] { card });
-
         // ---- ⑤b 广播：`OnOtherCardEnterPlay`（触发号 43）----
         //
         // ⚠️⚠️ 2026-10-03：**同一张旁观卡必须 T51 在前、T43 在后**（旧实现反了）。
@@ -1059,13 +1282,23 @@ public sealed class MatchEngine
         // 订阅这两个触发点的交集只有 4 张（card_brawl_test1 / card_location_british_scen5 /
         // card_unit_269th_rifles / card_unit_kv_1s），自测 `PlayCardOtherTriggersOrder` 直接守它。
         //
-        // ⚠️ 这里**只**挪 T43 的广播位置。T51 广播与「卡自己的 `RunDeploymentEffect`」的先后
-        //    （上面 ⑤ 那段注释）**不动** —— 那是另一个任务的范围。
+        // 两个广播都使用上面保存的早快照；同一张旁观卡仍保持 T51 在 T43 之前。
         // ⚠️ 用 `programName = "OnOtherCardEnterPlay"`（而不是 `otherProgramName`）：
         //    它的 `OnOther` 前缀让 `FireTrigger` 直接走广播分支，**不会**顺带把
         //    `OnEnterPlay` 再发给主体一次（那会变成自己那一路发两遍）。
-        Api.FireTrigger("OnOtherCardEnterPlay", card, card.Owner, eventArgs: new object?[] { card, 0 });
+        // The early recipient snapshot prevents a newly spawned card from
+        // observing this action's broadcast.  Replay evidence currently
+        // requires these broadcasts before the deployment effect; moving them
+        // after the effect regresses 854099 by seven human actions.
+        using var playedBroadcast = Api.BeginPlayedCardBroadcast(card.CardId);
+        Api.FireTrigger("OnOtherCardPlayedFromHand", card, card.Owner,
+            eventArgs: new object?[] { card }, recipientSnapshot: playedCardTriggerSnapshot);
+        Api.FireTrigger("OnOtherCardEnterPlay", card, card.Owner,
+            eventArgs: new object?[] { card, 0 }, recipientSnapshot: playedCardTriggerSnapshot);
 
+        // `AddToTriggerQueue` later invokes this card's own OnPlayedFromHand
+        // with the target captured at the original play time.
+        card.CurrentTarget = target;
         RunDeploymentEffect(card, target);
 
         // ---- ⑥ 山地加成（`GiveAlpineBonus`）----
@@ -1121,7 +1354,8 @@ public sealed class MatchEngine
     /// —— 内核里 `NotifySideEffectTrigger` 整条原语都没有实现（副作用通知通道），
     /// 不是本次范围，这里不猜它的子动作名。
     /// </summary>
-    private void RunDeploymentEffect(CardInstance card, CardInstance? target)
+    private void RunDeploymentEffect(CardInstance card, CardInstance? target, int? instigatorId = null,
+        bool nonTargeting = false)
     {
         // si=3640：没有 hasDeployment 的卡（全部指令 + 21 张没这个字段的单位）走 si=5840，
         // 那条路上 `_triggerMultiple` 恒 0 ⇒ 只跑一次，且**没有取消钩子**。
@@ -1132,19 +1366,27 @@ public sealed class MatchEngine
         }
 
         // si=3676..4278：事件 14 的取消钩子。
-        if (Api.FireDeploymentCancelHook(card))
+        if (Api.FireDeploymentCancelHook(card, instigatorId))
         {
             return;   // si=4297..4881：取消 ⇒ 整条部署效果不跑
         }
 
         // si=5702/5750：只在「非指向性」部署时取翻倍数（targetCardID == 0）。
-        int triggerMultiple = target is null ? Api.SumDeploymentTriggerMultiple(card) : 0;
+        int triggerMultiple = nonTargeting || target is null
+            ? Api.SumDeploymentTriggerMultiple(card, instigatorId)
+            : 0;
 
         // si=6114（第 1 次）+ si=6230..6434（再 triggerMultiple 次）。
         for (int i = 0; i <= triggerMultiple; i++)
         {
             Api.RunCardEffect(card, target);
         }
+    }
+
+    /// <summary>供 <c>CardApi.TriggerDeployment</c> 调用的主动部署效果入口。</summary>
+    public void RunDeploymentEffectForTrigger(CardInstance card, int instigatorId)
+    {
+        RunDeploymentEffect(card, card.CurrentTarget, instigatorId, nonTargeting: true);
     }
 
     /// <summary>
@@ -1162,14 +1404,16 @@ public sealed class MatchEngine
     /// `locationNumber` 按蓝图 `GetNextCardLocationNumber` 的规则「追加到队尾」
     /// （`= QtyInLocation`），而且计数**含 HQ** —— 所以第一个单位的槽位是 1，不是 0。
     /// </summary>
-    private void PlaceOnBoard(CardInstance card)
+    private void PlaceOnBoard(CardInstance card, bool toFrontline = false, int locationNumber = -1)
     {
         card.EnteredPlayOnTurn = State.Turn;
 
-        CardLocation half = card.Owner.HqOf();
-        int slot = State.Cards(card.Owner, half).Count;   // 追加到队尾（含 HQ 占的第 0 格）
-        State.Move(card, half, slot);
-        Say($"{card} 部署到半场 {half} 槽位 {slot}");
+        CardLocation destination = toFrontline ? CardLocation.BoardFrontline : card.Owner.HqOf();
+        int slot = locationNumber >= 0
+            ? locationNumber
+            : State.Cards(card.Owner, destination).Count;
+        State.Move(card, destination, slot);
+        Say($"{card} 部署到{(toFrontline ? "前线" : "半场")} {destination} 槽位 {slot}");
     }
 
     // ==================== 移动 ====================
@@ -1252,10 +1496,14 @@ public sealed class MatchEngine
             }
 
             // PinnedTurns == 1 ⇒ 到期解除（蓝图 RemovePin）
-            card.PinnedTurns = 0;
-            if (card.Keywords.Remove(Keyword.Pinned))
+            if (card.Keywords.Contains(Keyword.Pinned))
             {
+                Api.RemoveKeyword(card, Keyword.Pinned);
                 Say($"{card} 的钉住到期解除");
+            }
+            else
+            {
+                card.PinnedTurns = 0;
             }
         }
     }
@@ -1346,6 +1594,12 @@ public sealed class MatchEngine
             return false;
         }
 
+        if (Api.HasCustomAbility(unit, "cantMove"))
+        {
+            reason = "单位带有 cantMove 能力";
+            return false;
+        }
+
         // ★★ 2026-10-02（第二轮）：这里原先判 `Keyword.Suppressed` 并拒绝移动 ——
         //    **已删，那是误读**。`Suppress`（中文「抑制」）与 `Pin`（中文「压制」）
         //    是两个关键字：只有**压制**禁止行动（下面那道 `PinnedBlocksOperation`），
@@ -1407,7 +1661,11 @@ public sealed class MatchEngine
             return false;
         }
 
-        State.AddKredits(unit.Owner, -unit.OperationCost);
+        // 事件签名携带的是这次推进实际支付的费用。先保存再扣费，避免后续
+        // 任何费用重算让订阅卡读到错误值。
+        int moveCost = unit.OperationCost;
+        State.AddKredits(unit.Owner, -moveCost);
+        State.AddOperationKreditsSpentThisTurn(moveCost);
         unit.HasMovedThisTurn = true;
 
         RecordAction("XActionMoveCardToLine", unit.Owner, new Dictionary<string, object?>
@@ -1431,8 +1689,76 @@ public sealed class MatchEngine
         //    旧实现是反的（先 `OnMoveToFrontline`、再刷新归属并补发事件），
         //    收口到钩子里正好把这个顺序也扳正。
         State.Move(unit, CardLocation.BoardFrontline, targetSlot);
-        Api.FireTrigger("OnMoveToFrontline", unit, unit.Owner, "OnOtherCardMoveToFrontline");
+        var moveEventArgs = new object?[] { unit, false, moveCost };
+        var moveNamedArgs = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["cardMoved"] = unit,
+            ["ForceMove"] = false,
+            ["moveCost"] = moveCost,
+        };
+        Api.FireTrigger("OnMoveToFrontline", unit, unit.Owner, "OnOtherCardMoveToFrontline",
+            eventArgs: moveEventArgs,
+            eventSubject: unit,
+            namedArgs: moveNamedArgs);
 
+        FireOperationKreditsSpent(unit, moveCost);
+
+        return true;
+    }
+
+    /// <summary>
+    /// 蓝图 <c>MoveUnitFromSupportToFrontLine</c> 的效果位移路径。
+    ///
+    /// 这是卡牌效果调用的免费移动，不经过普通行动方、召唤失调、压制或油费门；
+    /// 蓝图只检查卡在场、<c>cantMove</c>、前线归属和前线容量。成功后不消耗
+    /// 单位的本回合移动额度，但仍派发位置变化与前线进入触发。
+    /// </summary>
+    public bool MoveUnitFromSupportToFrontLine(CardInstance unit, int instigatorID,
+                                               out string reason)
+    {
+        reason = "";
+        if (!unit.Location.IsBoard() || unit.IsHq)
+        {
+            reason = "目标不是场上单位";
+            return false;
+        }
+
+        if (Api.HasCustomAbility(unit, "cantMove"))
+        {
+            reason = "单位带有 cantMove 能力";
+            return false;
+        }
+
+        Side owner = State.FrontlineOwner;
+        if (owner != Side.NotAvailable && unit.Owner.Opposite() == owner)
+        {
+            reason = $"前线被对面占着（前线归属={owner}，本单位={unit.Owner}）";
+            return false;
+        }
+
+        if (owner == unit.Owner
+            && State.Cards(unit.Owner, CardLocation.BoardFrontline).Count >= State.FrontlineCapacity)
+        {
+            reason = $"我方前线已满（{State.Cards(unit.Owner, CardLocation.BoardFrontline).Count}" +
+                     $"/{State.FrontlineCapacity}）";
+            return false;
+        }
+
+        int locationNumber = State.NextLocationNumber(unit.Owner, CardLocation.BoardFrontline);
+        State.Move(unit, CardLocation.BoardFrontline, locationNumber);
+
+        var moveEventArgs = new object?[] { unit, true, 0 };
+        var moveNamedArgs = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["cardMoved"] = unit,
+            ["ForceMove"] = true,
+            ["moveCost"] = 0,
+            ["instigatorID"] = instigatorID,
+        };
+        Api.FireTrigger("OnMoveToFrontline", unit, unit.Owner, "OnOtherCardMoveToFrontline",
+            eventArgs: moveEventArgs,
+            eventSubject: unit,
+            namedArgs: moveNamedArgs);
         return true;
     }
 
@@ -1510,7 +1836,9 @@ public sealed class MatchEngine
     ///   名字里的 After 指的是「在其它触发点之后」，实测它和上面那个同一个入口）
     /// </summary>
     /// <param name="goingToLocation">卡要去哪（卡牌蓝图的第 1 个入参就是它）。</param>
-    public void FireLeaveTrigger(CardInstance card, CardLocation goingToLocation)
+    /// <param name="includeAfterEvents">是否执行销毁/转换路径的 after 离场事件。</param>
+    public void FireLeaveTrigger(CardInstance card, CardLocation goingToLocation,
+                                 bool includeAfterEvents = true)
     {
         if (card.IsHq)
         {
@@ -1535,6 +1863,11 @@ public sealed class MatchEngine
         Api.FireTrigger("OnLeaveBoardOrOwner", subject, subject.Owner,
             "OnAfterOtherCardLeaveBoardOrOwner", "OnLeaveBoardOrOwner", eventArgs, goingToLocation);
 
+        if (!includeAfterEvents)
+        {
+            return;
+        }
+
         // 「离场之后」—— 出处 `out/bp-cardfn.json` 函数
         // `ExecuteOnAfterLeaveBoardOrOwnerEvents`：
         //   `OnAfterLeaveBoard(ECardLocationEnum goingToLocation)`（自己，签名 `BaseCardObject.h:808`）
@@ -1557,6 +1890,39 @@ public sealed class MatchEngine
             ActionValue2.Int("instigatorID", card.CardId),
             ActionValue2.Int("goingToLocation", goingToLocation),
         });
+
+    /// <summary>
+    /// Dispatch the operation-cost event pair used by cards such as Landwehr.
+    /// The Blueprint helper broadcasts to other subscribers first, then calls
+    /// the operated card itself; a suppressed operated card skips both paths.
+    /// </summary>
+    private void FireOperationKreditsSpent(CardInstance operated, int cost)
+    {
+        if (operated.IsSuppressed)
+        {
+            return;
+        }
+
+        var otherNamedArgs = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["cardOperated"] = operated,
+            ["kreditsSpent"] = cost,
+        };
+        Api.FireTrigger("OnOtherCardOperationKreditsSpent", operated, operated.Owner,
+            eventArgs: new object?[] { operated, cost },
+            eventSubject: operated,
+            namedArgs: otherNamedArgs,
+            broadcastName: true);
+
+        var selfNamedArgs = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["kreditsSpent"] = cost,
+        };
+        Api.FireTrigger("OnOperationKreditsSpent", operated, operated.Owner,
+            eventArgs: new object?[] { cost },
+            eventSubject: operated,
+            namedArgs: selfNamedArgs);
+    }
 
     // ==================== 攻击 ====================
 
@@ -1771,7 +2137,9 @@ public sealed class MatchEngine
             return false;
         }
 
-        State.AddKredits(attacker.Owner, -attacker.OperationCost);
+        int attackCost = attacker.OperationCost;
+        State.AddKredits(attacker.Owner, -attackCost);
+        State.AddOperationKreditsSpentThisTurn(attackCost);
         attacker.HasAttackedThisTurn = true;
         // 攻击额度 -1（蓝图 `SetAttackerHasAttacked`，`BP_CardFunctions.g.cs:33930-33942`：
         // `attackLeft -= 1` / `hasAttackedThisTurn = True` / `attackCountThisTurn += 1`）。
@@ -1839,6 +2207,66 @@ public sealed class MatchEngine
         //    （与 `OnBeforeOtherCardPlayedFromHand` 同一个坑，见 `PlayCard` 里那段注释）。
         //    广播分支本身就排除主体，正好对上蓝图的 `item != _attackerCard`。
         Api.FireTrigger("OnBeforeOtherCardAttacks", attacker, attacker.Owner, broadcastName: true);
+
+        // T30 `OnOtherCardAttackSwitchTarget` runs after the attack declaration and
+        // before T31 can stop the attack.  The Blueprint keeps the original target
+        // in `oldDefender`; subscribers return the effective target through
+        // `newDefender` (gotcha cards may create and return a replacement unit).
+        var oldDefender = defender;
+        var switchTargetSeed = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["cardAttacking"] = attacker,
+            ["oldDefender"] = oldDefender,
+            ["cardID"] = attacker.CardId,
+        };
+        var switchedTargets = Api.BroadcastLocalWithOutParams(
+            "OnOtherCardAttackSwitchTarget", attacker, new[] { "newDefender" },
+            switchTargetSeed);
+        foreach (var hit in switchedTargets)
+        {
+            if (hit.Outs.GetValueOrDefault("newDefender") is CardInstance candidate
+                && candidate.IsAlive
+                && candidate.Location.IsBoard())
+            {
+                defender = candidate;
+            }
+        }
+
+        // T31 `OnOtherCardAttacks` is a locals-only event. Unlike the regular
+        // trigger table it returns `AttackedAndStopped`; any true result sends
+        // the attack down Blueprint's stopped-attack path before damage.
+        var attackEventSeed = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["cardAttacking"] = attacker,
+            ["defenderCard"] = defender,
+            ["cardID"] = attacker.CardId,
+        };
+        var stoppedAttack = Api.BroadcastLocalWithOutParams(
+            "OnOtherCardAttacks", attacker,
+            new[] { "stopAttack", "AttackedAndStopped" },
+            attackEventSeed);
+
+        // `ExecuteOnOperationKreditsSpent` runs after the pre-attack hooks and
+        // before either the normal damage path or the stopped-attack path.
+        // Keep it here so a stopped attack still counts as one operation, but
+        // the operation card is never charged twice.
+        FireOperationKreditsSpent(attacker, attackCost);
+
+        if (stoppedAttack.Any(hit => hit.Outs.GetValueOrDefault("stopAttack") is true
+            || hit.Outs.GetValueOrDefault("AttackedAndStopped") is true))
+        {
+            FireSubAction("ZActionAttackCard", new[]
+            {
+                ActionValue2.Int("attackerCardID", attacker.CardId),
+                ActionValue2.Int("defenderCardID", defender.CardId),
+                ActionValue2.Int("damageDefender", 0),
+                ActionValue2.Int("damageAttacker", 0),
+                ActionValue2.Int("attackerAttackLeft", attacker.Attack),
+                ActionValue2.Int("defenderDefense", defender.Defense),
+            });
+            CheckDeaths();
+            return true;
+        }
 
         bool shockAttack = attacker.Keywords.Contains(Keyword.Shock);
         bool ambushAttack = !defender.IsHq
@@ -2095,9 +2523,8 @@ public sealed class MatchEngine
     /// 2. **自己有 Guard ⇒ 恒 false**（掩护卡自己不免疫，si=686/718）；
     /// 3. 否则 ⟺ **同一条线上 locationNumber ± 1 的邻卡有 Guard**（si=847/1276/1405）。
     ///
-    /// ⚠️ 蓝图里还有一条 `!IsUnrevealedCovertCard` 的过滤（si=564/1206）——
-    /// 本内核没有建模 Covert（P1），所有卡都不是"未揭示的隐蔽卡"，
-    /// 所以这个条件恒真、不改变结果。**这是已知的近似，不是遗漏。**
+    /// 蓝图里还有一条 `!IsUnrevealedCovertCard` 的过滤（si=564/1206），
+    /// 由卡面 Covert 关键字和 `IsRevealed` 状态共同判定。
     /// </summary>
     public bool IsBeingGuarded(CardInstance card)
     {
@@ -2292,6 +2719,7 @@ public sealed class MatchEngine
         target.Defense -= amount;
         if (target.IsHq)
         {
+            State.UpdateHQDamagedAmountThisTurn(target.Owner, amount);
             Say($"HQ {target.Owner.ToWire()} 受到 {amount} 伤害，剩余 {target.Defense}");
             if (target.Defense <= 0)
             {
@@ -2403,6 +2831,11 @@ public sealed class MatchEngine
         // </code>
         var destroyedLocation = (int)card.Location;
 
+        if (((CardLocation)destroyedLocation).IsBoard())
+        {
+            State.RecordDestroyedCard(card.CardId, Api.IsUnit(card) && !card.IsHq);
+        }
+
         State.Move(card, CardLocation.Discard);
 
         // ---- 「被摧毁」----
@@ -2513,4 +2946,76 @@ public sealed class MatchEngine
 
     /// <summary>该动作名是否是「效果」而不是纯查询 —— 用于统计未实现的效果调用。</summary>
     public IReadOnlyDictionary<string, int> UnimplementedCalls => State.UnimplementedCalls;
+
+    /// <summary>
+    /// `ChangeUnitOwnership` 的无头实现。夺取控制权时把单位放到新控制方半场，
+    /// 释放时按调用方保存的原始位置恢复；两条路径都维护阵营索引、换区事件和协议子动作。
+    /// </summary>
+    public bool ChangeUnitOwnership(CardInstance card, int instigatorId, Side fromSide,
+                                    Side toSide, CardLocation originalLocation,
+                                    bool releaseControl)
+    {
+        if (!card.Definition.IsUnit || !card.Location.IsBoard()
+            || card.Owner != fromSide || toSide is Side.NotAvailable
+            || fromSide == toSide)
+        {
+            return false;
+        }
+
+        CardLocation oldLocation = card.Location;
+        Side oldOwner = card.Owner;
+        CardLocation destination = releaseControl ? originalLocation : toSide.HqOf();
+        if (destination is not (CardLocation.BoardHqLeft or CardLocation.BoardHqRight
+            or CardLocation.BoardFrontline))
+        {
+            destination = toSide.HqOf();
+        }
+
+        // Blueprint rejects a full destination during normal targeting. The release
+        // path can encounter it later, in which case the card retreats to the
+        // restored owner's hand instead of silently overfilling the support line.
+        bool destinationFull = destination switch
+        {
+            CardLocation.BoardFrontline => State.Cards(Side.Left, CardLocation.BoardFrontline).Count
+                + State.Cards(Side.Right, CardLocation.BoardFrontline).Count
+                - (oldLocation == CardLocation.BoardFrontline ? 1 : 0) >= State.FrontlineCapacity,
+            CardLocation.BoardHqLeft or CardLocation.BoardHqRight
+                => State.Cards(toSide, destination).Count >= GameState.HalfBoardCapacity,
+            _ => false,
+        };
+        if (destinationFull)
+        {
+            destination = toSide.HandOf();
+        }
+
+        FireLeaveTrigger(card, destination);
+        if (!State.ChangeOwner(card, toSide))
+        {
+            return false;
+        }
+
+        card.UnderEnemyControl = !releaseControl;
+        State.Move(card, destination, locationNumber: null, changeOwner: true);
+        card.HasMovedThisTurn = false;
+        card.AttacksThisTurn = 0;
+        card.HasAttackedThisTurn = false;
+
+        FireSubAction("ZActionChangeUnitOwnership", new[]
+        {
+            ActionValue2.Bool("releaseControl", releaseControl),
+            ActionValue2.Int("newLocation", (int)destination),
+            ActionValue2.Str("newSide", toSide.ToWire()),
+            ActionValue2.Int("oldLocation", (int)oldLocation),
+            ActionValue2.Str("oldSide", oldOwner.ToWire()),
+            ActionValue2.Int("instigatorID", instigatorId),
+        });
+
+        if (destination.IsBoard())
+        {
+            Api.FireTrigger("OnEnterPlay", card, card.Owner,
+                eventArgs: new object?[] { card, 0 });
+        }
+
+        return true;
+    }
 }

@@ -7,6 +7,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KLink.App", "KLink.App\KLin
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KLink.Server", "KLink.Server\KLink.Server.csproj", "{8192BB68-9032-4DD2-BE85-484961B783D5}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "KLink.Bot", "KLink.Bot\KLink.Bot.csproj", "{D0C2EFD9-4B69-4E23-B5D2-6E9C5C4A4F67}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -41,6 +43,16 @@ Global
 		{8192BB68-9032-4DD2-BE85-484961B783D5}.Release|x64.Build.0 = Release|Any CPU
 		{8192BB68-9032-4DD2-BE85-484961B783D5}.Release|x86.ActiveCfg = Release|Any CPU
 		{8192BB68-9032-4DD2-BE85-484961B783D5}.Release|x86.Build.0 = Release|Any CPU
+		{D0C2EFD9-4B69-4E23-B5D2-6E9C5C4A4F67}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{D0C2EFD9-4B69-4E23-B5D2-6E9C5C4A4F67}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{D0C2EFD9-4B69-4E23-B5D2-6E9C5C4A4F67}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{D0C2EFD9-4B69-4E23-B5D2-6E9C5C4A4F67}.Debug|x64.Build.0 = Debug|Any CPU
+		{D0C2EFD9-4B69-4E23-B5D2-6E9C5C4A4F67}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{D0C2EFD9-4B69-4E23-B5D2-6E9C5C4A4F67}.Debug|x86.Build.0 = Debug|Any CPU
+		{D0C2EFD9-4B69-4E23-B5D2-6E9C5C4A4F67}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{D0C2EFD9-4B69-4E23-B5D2-6E9C5C4A4F67}.Release|Any CPU.Build.0 = Release|Any CPU
+		{D0C2EFD9-4B69-4E23-B5D2-6E9C5C4A4F67}.Release|x64.ActiveCfg = Release|Any CPU
+		{D0C2EFD9-4B69-4E23-B5D2-6E9C5C4A4F67}.Release|x86.ActiveCfg = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

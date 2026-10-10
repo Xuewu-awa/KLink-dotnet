@@ -46,6 +46,10 @@ obj/
 *.db-journal
 data/
 
+# The server's source namespace is Data; only runtime data is ignored.
+!/KLink.Server/Data/
+!/KLink.Server/Data/*.cs
+
 config.json
 crash.log
 

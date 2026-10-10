@@ -1,4 +1,9 @@
 using System.Text.Json.Nodes;
+using System.Text.Json;
+using KLink.Bot.Cards;
+using KLink.Bot.Effects.Blueprint;
+using KLink.Bot.Engine;
+using KLink.Bot.Server;
 using KLink.Server.Data;
 using KLink.Server.Model;
 using KLink.Server.Util;
@@ -27,6 +32,8 @@ public sealed class MatchManager
     private readonly Dictionary<int, MatchState> _matches = new();
     private readonly HashSet<int> _kickedPlayers = new();
     private int _nextMatchId = 1;
+    private BotTurnService? _botService;
+    private string? _botLoadError;
 
     public MatchManager(AppDatabase database, AssetStore assets)
     {
@@ -468,35 +475,37 @@ public sealed class MatchManager
             }
             if (Environment.TickCount64 < match.BotTurnReadyAt) return;
 
-            // 插入起始回合 Action
             try
             {
-                var startTurn = new JsonObject
+                if (EnsureBotService() is { } bot)
                 {
-                    ["action_type"] = "XActionStartOfTurn",
-                    ["player_id"] = match.PlayerRight,
-                    ["action_data"] = new JsonObject { ["side"] = "right" },
-                    ["sub_actions"] = new JsonArray(),
-                    ["turn_number"] = match.CurrentTurn,
-                };
-                AppendBotAction(match, startTurn);
-
-                // 插入结束回合 Action
-                var endTurn = new JsonObject
+                    var snapshot = BuildBotSnapshot(match);
+                    var result = bot.DecideTurn(snapshot);
+                    string hqKey = FindHqKey(snapshot);
+                    var startData = new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["side"] = "right",
+                    };
+                    if (result.HqOpponentBefore > 0)
+                        startData[hqKey] = result.HqOpponentBefore.ToString();
+                    AppendBotAction(match, new ServerAction(match.CurrentActionId + 1,
+                        "XActionStartOfTurn", match.PlayerRight, startData, result.State?.Turn ?? match.CurrentTurn));
+                    foreach (var action in result.Actions)
+                        AppendBotAction(match, action);
+                }
+                else
                 {
-                    ["action_type"] = "XActionEndOfTurn",
-                    ["player_id"] = match.PlayerRight,
-                    ["action_data"] = new JsonObject { ["reason"] = "endTurnButton", ["side"] = "right" },
-                    ["sub_actions"] = new JsonArray(),
-                    ["turn_number"] = match.CurrentTurn,
-                };
-                AppendBotAction(match, endTurn);
+                    AppendLegacyBotTurn(match);
+                }
 
                 match.CurrentTurn++;
             }
-            catch
+            catch (Exception ex)
             {
-                // 忽略 Bot 动作异常
+                _botLoadError ??= ex.ToString();
+                ServerEvents.Log("Bot 回合失败，退回仅结束回合：" + ex.Message);
+                AppendLegacyBotTurn(match);
+                match.CurrentTurn++;
             }
 
             match.BotLastEndedTurn = match.CurrentTurn - 1;
@@ -505,27 +514,154 @@ public sealed class MatchManager
         }
     }
 
-    private void AppendBotAction(MatchState match, JsonObject action)
+    private void AppendBotAction(MatchState match, ServerAction action)
     {
-        string actionType = action["action_type"]?.GetValue<string>() ?? "";
-        int playerId = action["player_id"]?.GetValue<int>() ?? 0;
-        var actionData = action["action_data"] as JsonObject;
-        int turnNumber = action["turn_number"]?.GetValue<int>() ?? 0;
-
         match.CurrentActionId++;
         var fullAction = new JsonObject
         {
             ["action_id"] = match.CurrentActionId,
-            ["action_type"] = actionType,
-            ["player_id"] = playerId,
-            ["action_data"] = actionData?.DeepClone() ?? new JsonObject(),
+            ["action_type"] = action.ActionType,
+            ["player_id"] = action.PlayerId,
+            ["action_data"] = new JsonObject(action.ActionData.Select(kv => KeyValuePair.Create<string, JsonNode?>(kv.Key, JsonValue.Create(kv.Value)))),
             ["sub_actions"] = new JsonArray(),
-            ["turn_number"] = turnNumber,
+            ["turn_number"] = action.TurnNumber,
         };
         match.Actions.Add(match.CurrentActionId);
 
         string encrypted = _actionCipher.Encode(match.ActionSessionId, fullAction);
         match.ActionsData[match.CurrentActionId] = encrypted;
+    }
+
+    private void AppendLegacyBotTurn(MatchState match)
+    {
+        AppendBotAction(match, new ServerAction(match.CurrentActionId + 1, "XActionStartOfTurn",
+            match.PlayerRight, new Dictionary<string, string> { ["side"] = "right" }, match.CurrentTurn));
+        AppendBotAction(match, new ServerAction(match.CurrentActionId + 1, "XActionEndOfTurn",
+            match.PlayerRight, new Dictionary<string, string> { ["reason"] = "endTurnButton", ["side"] = "right" }, match.CurrentTurn));
+    }
+
+    private BotTurnService? EnsureBotService()
+    {
+        if (_botService is not null) return _botService;
+        if (_botLoadError is not null) return null;
+        try
+        {
+            string dataDir = Path.Combine(AppContext.BaseDirectory, "Data");
+            var db = CardDatabase.Load(dataDir);
+            KismetLibrary.Initialize(Path.Combine(dataDir, "card-ir.json"));
+            var service = new BotTurnService(db, Side.Right, MatchState.BotPlayerId);
+            string codesPath = Path.Combine(dataDir, "deck_code_ids.json");
+            var codes = new Dictionary<string, string>(StringComparer.Ordinal);
+            if (File.Exists(codesPath))
+            {
+                var node = JsonNode.Parse(File.ReadAllText(codesPath)) as JsonObject;
+                if (node is not null)
+                    foreach (var (code, value) in node)
+                    {
+                        string? name = value switch
+                        {
+                            JsonValue v when v.TryGetValue<string>(out var s) => s,
+                            JsonObject o => o["card"]?.GetValue<string>() ?? o["name"]?.GetValue<string>(),
+                            _ => null,
+                        };
+                        if (!string.IsNullOrEmpty(name)) codes[code] = name;
+                    }
+            }
+            service.LoadDeckCodeTable(codes);
+            return _botService = service;
+        }
+        catch (Exception ex)
+        {
+            _botLoadError = ex.Message;
+            ServerEvents.Log("Bot 内核加载失败：" + ex.Message);
+            return null;
+        }
+    }
+
+    private ServerMatchSnapshot BuildBotSnapshot(MatchState match)
+    {
+        var cards = new Dictionary<int, ServerCard>();
+        AddCards(cards, match.LeftCardsData);
+        AddCards(cards, match.RightCardsData);
+        AddCards(cards, match.LeftHandCards);
+        AddCards(cards, match.RightHandCards);
+        AddCards(cards, match.LeftDeckCards);
+        AddCards(cards, match.RightDeckCards);
+        // Mulligan 弃牌不会进入动作流；必须把它们以 Discard 位置覆盖
+        // 初始卡池中的同一张卡，否则 ReplayRunner 会把弃掉的起手牌再次当作牌库卡。
+        AddDiscardedCards(cards, match.LeftDiscardedCards, Side.Left);
+        AddDiscardedCards(cards, match.RightDiscardedCards, Side.Right);
+
+        var actions = new List<ServerAction>();
+        foreach (var idNode in match.Actions)
+        {
+            int id = idNode?.GetValue<int>() ?? 0;
+            if (id == 0 || !match.ActionsData.TryGetValue(id, out var packet)) continue;
+            try
+            {
+                var payload = _actionCipher.Decode(packet).Payload;
+                var wire = WireAction.Parse(payload);
+                actions.Add(new ServerAction(wire.ActionId == 0 ? id : wire.ActionId,
+                    wire.ActionType, wire.PlayerId, wire.ActionData, wire.TurnNumber));
+            }
+            catch (Exception ex)
+            {
+                ServerEvents.Log($"Bot 快照跳过无法解密动作 #{id}：{ex.Message}");
+            }
+        }
+
+        return new ServerMatchSnapshot(match.MatchId, match.CurrentTurn, match.PlayerLeft,
+            match.PlayerRight, cards.Values.ToArray(), actions)
+        {
+            NextActionId = match.CurrentActionId + 1,
+            SendActionId = match.CurrentActionId,
+        };
+    }
+
+    private static void AddCards(Dictionary<int, ServerCard> cards, JsonArray array)
+    {
+        foreach (var node in array)
+        {
+            if (node is not JsonObject c) continue;
+            int id = c["card_id"]?.GetValue<int>() ?? 0;
+            if (id <= 0) continue;
+            cards[id] = new ServerCard(id, c["is_gold"]?.GetValue<bool>() ?? false,
+                c["location"]?.GetValue<string>() ?? "", c["location_number"]?.GetValue<int>() ?? 0,
+                c["name"]?.GetValue<string>() ?? "");
+        }
+    }
+
+    private static void AddDiscardedCards(Dictionary<int, ServerCard> cards, JsonArray array, Side side)
+    {
+        string location = side == Side.Left ? "discard_left" : "discard_right";
+        foreach (var node in array)
+        {
+            if (node is not JsonObject card)
+            {
+                continue;
+            }
+
+            int id = card["card_id"]?.GetValue<int>() ?? 0;
+            if (id <= 0)
+            {
+                continue;
+            }
+
+            cards[id] = new ServerCard(id,
+                card["is_gold"]?.GetValue<bool>() ?? false,
+                location,
+                card["location_number"]?.GetValue<int>() ?? 0,
+                card["name"]?.GetValue<string>() ?? "");
+        }
+    }
+
+    private static string FindHqKey(ServerMatchSnapshot snapshot)
+    {
+        foreach (var action in snapshot.Actions)
+            foreach (var key in action.ActionData.Keys)
+                if (key.Length > 0 && key.All(char.IsAsciiDigit) && key is not ("0" or "1" or "2" or "3" or "4"))
+                    return key;
+        return "40";
     }
 
     private void PrepareBotMulligan(MatchState match)

@@ -51,7 +51,7 @@ public static class CardEffectScripts
         api.ChangeDefense(hq, 3, ctx.Self);
 
         // GainKreditSlot
-        api.GainKreditSlot(ctx.Controller, 1);
+        api.GainKreditSlot(ctx.Controller, 1, ctx.Self);
     }
 }
 

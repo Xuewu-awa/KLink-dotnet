@@ -188,7 +188,7 @@ public sealed class BotTurnService
         int hqOpponentBefore = state.HqDefense(_botSide.Opposite());
 
         log.Add($"局面重建：回合 {state.Turn}，行动方 {state.ActiveSide.ToWire()}，" +
-                $"动作 {report.AppliedCount}/{report.TotalActions} 已应用" +
+                $"动作 {report!.AppliedCount}/{report.TotalActions} 已应用" +
                 (unapplied > 0 ? $"（⚠ {unapplied} 条没应用）" : "") +
                 $"，HQ 左{state.HqDefense(Side.Left)}/右{state.HqDefense(Side.Right)}");
 

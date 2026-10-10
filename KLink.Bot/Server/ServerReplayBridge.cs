@@ -112,7 +112,9 @@ public static class ServerReplayBridge
     /// 服务端的 `location` 字符串 → (内核位置, 归属方)。
     ///
     /// 字符串取值取自 fyserver 的 `GetCardsFromDeck` / `MakeMatchStartingInfo`：
-    /// `board_hqleft` / `board_hqright` / `hand_left` / `hand_right` / `deck_left` / `deck_right`。
+    /// `board_hqleft` / `board_hqright` / `hand_left` / `hand_right` / `deck_left` /
+    /// `deck_right`；`discard_left` / `discard_right` 是 KLink 在换牌快照中补出的
+    /// 明确归属别名，真实线上 `discard` 位置仍然不接受，因为它没有侧信息。
     ///
     /// ⚠️ 返回**分侧**枚举（`DeckLeft`/`DeckRight`…），不是 `CardLocation.Deck`/`Hand`。
     /// </summary>
@@ -126,6 +128,8 @@ public static class ServerReplayBridge
             case "hand_right": location = CardLocation.HandRight; owner = Side.Right; return true;
             case "deck_left": location = CardLocation.DeckLeft; owner = Side.Left; return true;
             case "deck_right": location = CardLocation.DeckRight; owner = Side.Right; return true;
+            case "discard_left": location = CardLocation.Discard; owner = Side.Left; return true;
+            case "discard_right": location = CardLocation.Discard; owner = Side.Right; return true;
             case "discard": location = CardLocation.Discard; owner = Side.NotAvailable; return false;
             default: location = CardLocation.NotAvailable; owner = Side.NotAvailable; return false;
         }
