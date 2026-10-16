@@ -1,0 +1,133 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <ApplicationIcon>fyserver.ico</ApplicationIcon>
+    <!-- 反射 JSON 序列化关闭：全部走源生成上下文（FyJsonContext / ConfigJsonContext / StoreJsonContext），NativeAOT 兼容 -->
+    <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
+    <BotDataRoot Condition="'$(BotDataRoot)' == ''">$(MSBuildThisFileDirectory)..\..\..\klink bot\klink bot\docs</BotDataRoot>
+  </PropertyGroup>
+
+  <!--
+    NativeAOT 发布，默认开启。游戏 API 与后台（静态页 /admin-ui + JSON 接口 /admin/api）都完全 AOT 兼容：
+    后台界面是纯静态 HTML/JS，由 UseStaticFiles 提供，不含 Razor/MVC 运行时反射。
+    （历史：Razor Pages 版后台在 AOT 下启动会抛 TypeLoadException，已在改用静态后台后移除。）
+  -->
+  <PropertyGroup>
+    <EnableAot Condition="'$(EnableAot)' == ''">true</EnableAot>
+    <PublishAot>$(EnableAot)</PublishAot>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <NoWarn>$(NoWarn);IL2026;IL2104;IL3053;IL3050</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="faster-log\**" />
+    <Content Remove="faster-log\**" />
+    <EmbeddedResource Remove="faster-log\**" />
+    <None Remove="faster-log\**" />
+    <!-- 本地运行数据与分发产物绝不能递归进入 publish 输出。 -->
+    <Compile Remove="data\**;artifacts\**;wwwroot\admin-preview\**" />
+    <Content Remove="data\**;artifacts\**;AdminUi\**;wwwroot\admin-preview\**;wwwroot\admin-ui\assets\fyserver-logo.png" />
+    <EmbeddedResource Remove="data\**;artifacts\**;wwwroot\admin-preview\**" />
+    <None Remove="data\**;artifacts\**;wwwroot\admin-preview\**;wwwroot\admin-ui\assets\fyserver-logo.png" />
+  </ItemGroup>
+
+  <!-- Vite builds the Vue admin pages to wwwroot/admin-ui before ASP.NET collects static assets. -->
+  <Target Name="BuildAdminUi" BeforeTargets="PrepareForBuild"
+          Condition="'$(DesignTimeBuild)' != 'true' and '$(SkipAdminUiBuild)' != 'true'">
+    <Exec WorkingDirectory="$(MSBuildProjectDirectory)/AdminUi"
+          Command="npm ci --no-audit --no-fund"
+          Condition="!Exists('$(MSBuildProjectDirectory)/AdminUi/node_modules/vite/package.json') or !Exists('$(MSBuildProjectDirectory)/AdminUi/node_modules/vue/package.json') or !Exists('$(MSBuildProjectDirectory)/AdminUi/node_modules/@vitejs/plugin-vue/package.json')" />
+    <Exec WorkingDirectory="$(MSBuildProjectDirectory)/AdminUi" Command="npm run build" />
+  </Target>
+
+  <ItemGroup>
+    <Content Remove="deckCodeIDsTable2.json" />
+    <Content Update="cards-from-fmodel.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.FASTER.Core" Version="2.6.5" />
+    <PackageReference Include="MySqlConnector" Version="2.6.2" />
+    <PackageReference Include="Npgsql" Version="10.0.0" />
+  </ItemGroup>
+
+  <!--
+    ── bot（KLink.Bot 规则内核）──────────────────────────────────────────────
+    接服务器：`MatchEndpoints` 在 `Ex=="pw"` 的回合结束时调 `ServerBotService`，
+    由内核重建局面 → 决策 → 产出的动作 append 进同一队列。
+
+    ⚠️ AOT：内核用**反射式** JSON 反序列化（`JsonSerializer.Deserialize<T>`），
+       而本工程把 `JsonSerializerIsReflectionEnabledByDefault` 关掉了、
+       并且 `PublishAot=true`。所以：
+         · `dotnet build` / `dotnet run` 正常（反射可用）
+         · **`dotnet publish` 出 AOT 版时内核的 JSON 会失败**（被 trim 掉）
+       要出 AOT 分发版，需要给内核的模型类加源生成上下文，或对本工程关 AOT。
+       当前先用非 AOT 跑通链路。
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\KLink.Bot\KLink.Bot.csproj" />
+  </ItemGroup>
+
+  <!-- 内核需要的静态数据：副本进 bin，也进 publish（服务器要自包含） -->
+  <ItemGroup>
+    <None Include="$(BotDataRoot)\cards.live.json" Link="BotData\cards.json"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="$(BotDataRoot)\card-effects.json" Link="BotData\card-effects.json"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="$(BotDataRoot)\card-ir.json" Link="BotData\card-ir.json"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="$(BotDataRoot)\deck_code_ids.live.json" Link="BotData\deck_code_ids.json"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <!-- 卡面向量（神经网络输入要用）。缺失时内核自动退回贪心策略。 -->
+    <None Include="$(BotDataRoot)\card-vectors.json" Link="BotData\card-vectors.json"
+          CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 支持直接从 bin/<Configuration>/<TFM> 启动可执行文件。 -->
+    <Content Update="wwwroot\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+    <Content Update="library\bitemLib.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Update="library\cardbackLib.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Update="config\frontpage.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Update="config\serverOptions.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Update="config\serverOptions.schema.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+    </Content>
+    <Content Update="config\serverOptions.flags.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
+    </Content>
+    <Content Update="config\store.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Update="library\deckCodeIDsTable2.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+    <Content Update="library\emojiLib.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
+  <ProjectExtensions><VisualStudio><UserProperties /></VisualStudio></ProjectExtensions>
+
+</Project>

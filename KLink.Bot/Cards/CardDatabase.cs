@@ -74,7 +74,7 @@ public sealed class CardDefinition
     public IReadOnlyDictionary<string, string[]> FunctionCalls { get; init; }
         = new Dictionary<string, string[]>();
 
-    public bool IsUnit => Type is "infantry" or "tank" or "artillery" or "fighter" or "bomber";
+    public bool IsUnit => Type is "infantry" or "tank" or "artillery" or "fighter" or "bomber" or "antiair";
     public bool IsOrder => Type == "order";
     public bool IsLocationCard => Type == "location";
 
@@ -364,4 +364,3 @@ public sealed class CardDatabase
     }
 
 }
-

@@ -59,6 +59,9 @@ public sealed record ServerMatchSnapshot(
     /// </summary>
     public int SendActionId { get; init; }
 
+    /// <summary>fyserver ActionCipher 包头使用的整局会话 ID。</summary>
+    public int ActionSessionId { get; init; }
+
     /// <summary>
     /// 卡 **枚举顺序** 必须让 `locationNumber` 说了算，所以这里按
     /// (owner, location, locationNumber) 排一遍再交给内核。

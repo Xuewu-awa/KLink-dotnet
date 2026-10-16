@@ -76,13 +76,14 @@ src/
 
 ## 构建
 
-需要 [.NET 10 SDK](https://dotnet.microsoft.com/)。
+需要 [.NET 10 SDK](https://dotnet.microsoft.com/)。当前源码 checkout 的 solution 是 `KLink.sln`；详细的 KLink-dotnet、KLink-bot 与 fyserver 构建/集成步骤见 [BUILDING.md](BUILDING.md)。
 
-```bash
-dotnet build KLink.slnx -c Release
+```powershell
+dotnet restore KLink.sln
+dotnet build KLink.sln -c Release
 ```
 
-输出：`KLink.App/bin/Release/net10.0-windows/KLink.App.exe`
+该 solution 构建 WPF 启动器与 `KLink.Server` 项目；Bot 内核和独立 fyserver 需要按构建指南单独构建。完整桌面发行版还需要把 fyserver 自包含产物装配到启动器同级的 `data\fyserver\`。
 
 启动器会自动从自身位置向上查找游戏本体（`kds\kards\Binaries\Win64\`），无需手动配置；找不到时可在「设置」页手动指定。
 

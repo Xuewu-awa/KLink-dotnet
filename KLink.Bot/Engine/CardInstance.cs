@@ -23,7 +23,17 @@ public sealed class CardInstance
     /// </summary>
     public required string Name { get; set; }
 
-    public required Side Owner { get; init; }
+    /// <summary>当前控制方。夺取控制权时会改变；卡的原始归属见 <see cref="OriginalOwner"/>。</summary>
+    public required Side Owner { get; set; }
+
+    /// <summary>
+    /// 创建时的原始归属（蓝图 <c>originalSide</c>）。
+    /// 旧的手工测试卡没有填这个字段时，读取方会回退到当前归属。
+    /// </summary>
+    public Side OriginalOwner { get; init; } = Side.NotAvailable;
+
+    /// <summary>当前是否由原始敌方控制（蓝图 <c>underEnemyControl</c>）。</summary>
+    public bool UnderEnemyControl { get; set; }
 
     /// <summary>卡面定义。同 <see cref="Name"/>：可被 <see cref="Reidentify"/> 就地换掉。</summary>
     public required CardDefinition Definition { get; set; }
@@ -33,6 +43,13 @@ public sealed class CardInstance
     // ---- 位置 ----
     public CardLocation Location { get; set; }
     public int LocationNumber { get; set; }
+
+    /// <summary>
+    /// 这张卡最近一次从手牌触发时收到的目标。
+    /// 蓝图的 <c>OnPlayedFromHand</c> 延迟调用会从 queued card 的
+    /// <c>currentTarget</c> 读取它，而不是重新推导目标。
+    /// </summary>
+    public CardInstance? CurrentTarget { get; set; }
 
     // ---- 数值（可被效果修改，所以与 Definition 分开）----
     public int Attack { get; set; }
@@ -100,13 +117,21 @@ public sealed class CardInstance
     /// 读取方：`SetCardsSeenByCipher` 自己攒「未见面」候选时的 `:34137`
     /// （`if (cardSeen) 跳过`），以及 11 张卡的 IR 体。
     ///
-    /// ⚠️ **IR 侧读不到这个成员**：成员表在
-    /// `Effects/Blueprint/KismetVm.cs:961-1038`，本轮**不在改动范围内**
-    /// ⇒ 那 11 张卡读 `cardSeen` 仍然得到 `null`（判假）。
-    /// 这个字段是为**C# 侧语义正确**（`SetCardsSeenByCipher` 的"未见面"过滤）
-    /// 与自测可观测而加的，如实标注这处**未接线**。
+    /// Blueprint IR 通过 `KismetVm.GetMember` 读取该字段，供效果筛除已揭示手牌。
     /// </summary>
     public bool CardSeen { get; set; }
+
+    /// <summary>蓝图 `isRevealed`：Covert 卡公开后持续保留的状态。</summary>
+    public bool IsRevealed { get; set; }
+
+    /// <summary>蓝图 `isSalvaged`：由 Salvage 生成的手牌复制品标记。</summary>
+    public bool IsSalvaged { get; set; }
+
+    /// <summary>蓝图 `salvageFaction`：被打捞原卡的阵营名称。</summary>
+    public string? SalvageFaction { get; set; }
+
+    /// <summary>蓝图 `salvagedCardID`：被打捞原卡的 cardID。</summary>
+    public int SalvagedCardId { get; set; }
 
     /// <summary>
     /// `cipher` —— 卡的**情报值**（`AddIntelToCard` 写、`SetCardsSeenByCipher` /
@@ -264,7 +289,7 @@ public sealed class CardInstance
            //   （蓝图门是 `HasAttackLeft(attackerCard)`，额度 `attackLeft` 回合开始
            //   被设成 `getHasFury() ? 2 : 1`）。实测对局 389594 `#85/#86 t19`。
            && HasAttackLeft
-           // ★ 移动过就不能再攻击 —— **除非是坦克**。
+           // ★ 移动过就不能再攻击 —— **除非是坦克或蓝图授予的同回合行动能力**。
            //   出处 `KARDS基础规则参考.md` 兵种表：
            //     「**坦克**：能在同一回合移动并攻击（一次移动 + 一次攻击，顺序任意）」
            //   表里**只有坦克**有这条例外；步兵/炮兵/战斗机/轰炸机都没写
@@ -272,15 +297,15 @@ public sealed class CardInstance
            //   （实测 2026-10-02：AI 的步兵部署后立刻移动并攻击，就是缺这条。）
            //   蓝图同结论：`MoveCardToFrontline`（`BP_CardFunctions.g.cs:26978-27043`）
            //   对**不是** `CanMoveAndAttackInTheSameTurn` 的单位把 `attackLeft` 直接置 0
-           //   （而那个自定义能力正是 `MakeCountAsTank` 给的，同文件 `:26070`）。
-           && (IsTank || !HasMovedThisTurn)
+           //   （`MakeCountAsTank` 与 `card_unit_obice_da_75_13` 都通过该能力名放行）。
+           && (IsTank || CanMoveAndAttackInSameTurn || !HasMovedThisTurn)
            && !HasDeploymentSickness(state);
 
     /// <summary>
     /// 该卡本回合是否还能移动战线（同样受召唤失调限制，见
     /// <see cref="HasDeploymentSickness"/> 里 `CanCardDoAnything` 的出处）。
     ///
-    /// ★ 与 <see cref="CanOperateThisTurn"/> 对称：**攻击过就不能再移动，除非是坦克**。
+    /// ★ 与 <see cref="CanOperateThisTurn"/> 对称：**攻击过就不能再移动，除非是坦克或蓝图授予的同回合行动能力**。
     /// </summary>
     public bool CanMoveThisTurn(GameState state)
         => AliveOnBoard
@@ -288,8 +313,18 @@ public sealed class CardInstance
            //    移动侧的蓝图门是 `BP_Logic::CanCardDoAnything`（i=198 是 `IsPinned`），
            //    里面**没有** `isSuppressed`（全文件 0 次）。
            && !HasMovedThisTurn
-           && (IsTank || !HasAttackedThisTurn)
+           && (IsTank || CanMoveAndAttackInSameTurn || !HasAttackedThisTurn)
            && !HasDeploymentSickness(state);
+
+    /// <summary>
+    /// 蓝图的 `CanMoveAndAttackInTheSameTurn` 自定义能力标记。
+    /// `card_unit_obice_da_75_13` 在 Alpine 单位进入或离场时通过
+    /// `CustomName1Add/Remove` 维护这个标记；它和坦克一样允许移动、攻击顺序互换。
+    /// </summary>
+    public bool CanMoveAndAttackInSameTurn
+        => CustomJson.TryGetValue("customName1", out string? value)
+           && value.Split(',', StringSplitOptions.RemoveEmptyEntries)
+               .Contains("CanMoveAndAttackInTheSameTurn", StringComparer.Ordinal);
 
     /// <summary>
     /// 被**抑制**（客户端中文译名；英文关键字 = `Suppress`，字段 = 卡对象上的
@@ -317,6 +352,16 @@ public sealed class CardInstance
     /// ⇒ 本标志一旦为真就**保持到游戏结束**（与客户端一致）。见 <see cref="SuppressedOnTurn"/>。
     /// </summary>
     public bool IsSuppressed => Keywords.Contains(Keyword.Suppressed);
+
+    /// <summary>
+    /// 被抑制时仍允许接收的触发程序名。
+    ///
+    /// 蓝图的全局派发门是
+    /// <c>isSuppressed &amp;&amp; !suppressionExceptionTriggers.Contains(trigger)</c>；
+    /// 当前卡数据没有可加载的白名单来源，因此默认为空，保留一个可扩展的
+    /// 运行时集合，待取得逐卡证据后再填充。
+    /// </summary>
+    public HashSet<string> SuppressionExceptionTriggers { get; } = new(StringComparer.Ordinal);
 
     /// <summary>
     /// 被**抑制**时的回合号 —— **仅作诊断留痕**（2026-10-02 第三轮改写）。
@@ -474,6 +519,13 @@ public sealed class CardInstance
     public Dictionary<string, string> CustomJson { get; } = new(StringComparer.Ordinal);
 
     /// <summary>
+    /// Blueprint TSet members that must survive separate event/function VM
+    /// frames.  Values remain object-typed because the generated IR omits the
+    /// native element type (the gameplay member currently stores card refs).
+    /// </summary>
+    public Dictionary<string, HashSet<object?>> BlueprintSets { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// buff 记录：(来源卡, 是否临时) → 该来源施加的修正。
     /// 用于 `RemoveTheBuff` / `checkAndUpdateBuffOnCard` / 回合结束清理。
     ///
@@ -485,6 +537,14 @@ public sealed class CardInstance
     /// 所以拆成两条。
     /// </summary>
     public Dictionary<(int SourceCardId, bool Temporary), CardBuff> BuffsBySource { get; } = new();
+
+    /// <summary>
+    /// Blueprint's runtime <c>attackBuff</c> member: the aggregate attack
+    /// modifier currently applied to this card. ChangeAttack mutations are
+    /// tracked per source here, so this is a derived view rather than separate
+    /// mutable state.
+    /// </summary>
+    public int AttackBuff => BuffsBySource.Values.Sum(buff => buff.Attack);
 
     /// <summary>
     /// 是否为 HQ 卡（`card_location_*`，类型 <c>location</c>）。
@@ -634,47 +694,48 @@ public sealed class CardInstance
     }
 
     /// <summary>
-    /// 有效费用 = 卡面费用 + 各来源的改费之和，并按卡面规则夹下限。
+    /// 有效费用 = 卡面费用 + 各来源的改费之和，最低为 0。
     ///
-    /// 下限规则（实测来自 `card_event_committed_crew` 与 `card_unit_85_pioneer_company`
-    /// 两张光环的差别）：
-    /// - 普通改费（`ChangeKreditCost` 的 changeType=0，例如 85 先驱的「指令 -1」）
-    ///   **下限 1** —— 卡面上写的就是「costs 1 less」，1 费指令不该变成 0 费；
-    /// - 显式设费（changeType=1，例如 committed_crew 的 `getTotalKreditCost * -1`）
-    ///   允许到 0 —— 它的卡面明说「Spitfires cost 0 to deploy」。
-    ///
-    /// 只要某个来源声明了「可到 0」，整体下限就放开：committed_crew 的
-    /// 「-当前总费用」本来就是把费用设成绝对 0，不该被 1 卡住。
+    /// 费用下限是通用规则，不区分单位、指令或反制卡；普通减费也可以
+    /// 把一张 1 费卡降到 0。卡面明确写「minimum of 1」的效果仍应由该
+    /// 效果自己的蓝图逻辑施加额外限制，而不是由全局费用模型假定。
     /// </summary>
     public int EffectiveKreditCost
     {
         get
         {
             int total = Definition.Kredits;
-            bool mayReachZero = Definition.Kredits <= 0;
             foreach (var buff in BuffsBySource.Values)
             {
                 total += buff.KreditCost;
-                mayReachZero |= buff.KreditCostSetsAbsoluteValue;
             }
 
-            int floor = mayReachZero ? 0 : MinKreditCost;
-            return Math.Max(floor, total);
+            return Math.Max(MinKreditCost, total);
         }
     }
 
-    /// <summary>非「可到 0」卡的改费下限。见 <see cref="EffectiveKreditCost"/>。</summary>
-    public const int MinKreditCost = 1;
+    /// <summary>所有卡牌的通用费用下限；卡面明确写 minimum of 1 的效果另行处理。</summary>
+    public const int MinKreditCost = 0;
 
     /// <summary>有效行动费用 = 卡面行动费用 + 各来源的加减（下限 0）。</summary>
     public int EffectiveOperationCost
     {
         get
         {
-            int total = Definition.OperationCost;
+            // Direct-set buffs replace the card value; relative buffs still
+            // compose on top regardless of dictionary insertion order.
+            var absolute = BuffsBySource.Values
+                .Where(buff => buff.OperationCostSetsAbsoluteValue)
+                .LastOrDefault();
+            int total = absolute is null
+                ? Definition.OperationCost
+                : Definition.OperationCost + absolute.OperationCost;
             foreach (var buff in BuffsBySource.Values)
             {
-                total += buff.OperationCost;
+                if (!buff.OperationCostSetsAbsoluteValue)
+                {
+                    total += buff.OperationCost;
+                }
             }
 
             return Math.Max(0, total);
@@ -697,6 +758,15 @@ public sealed class CardInstance
         {
             HasBeenAttackedThisTurn = HasBeenAttackedThisTurn,
             PinnedTurns = PinnedTurns,
+            IsRevealed = IsRevealed,
+            IsSalvaged = IsSalvaged,
+            SalvageFaction = SalvageFaction,
+            SalvagedCardId = SalvagedCardId,
+            BlueprintSets = BlueprintSets
+                .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                .ToDictionary(kv => kv.Key,
+                    kv => kv.Value.Select(v => v is CardInstance card ? card.CardId : v is int id ? id : 0)
+                        .OrderBy(id => id).ToArray(), StringComparer.Ordinal),
         };
 }
 
@@ -718,15 +788,17 @@ public sealed class CardBuff
     /// <summary>行动费用相对**卡面行动费用**的偏移量。</summary>
     public int OperationCost { get; set; }
 
+    /// <summary>该来源是否把行动费用直接设为某个绝对值。</summary>
+    public bool OperationCostSetsAbsoluteValue { get; set; }
+
     /// <summary>重甲点数（可叠加的数值，不是布尔）。</summary>
     public int HeavyArmor { get; set; }
 
     /// <summary>
     /// 这个来源的改费是「显式设成绝对值」而不是「相对减费」。
     ///
-    /// 判据：`ChangeKreditCost(卡, 来源, 数值, changeType)` 的 changeType=1
-    /// （实测 `card_event_committed_crew` 用 `-getTotalKreditCost` + changeType=1
-    /// 把 Spitfire 设成 0 费，而 `card_unit_85_pioneer_company` 用 -1 + changeType=0）。
+    /// 判据：设值分支使用线上 `changeType=2/3`；手写 `committed_crew` 光环仍用
+    /// 兼容标记保存其“设为 0”语义，而普通 `changeType=1` 是永久相对修正。
     /// 它决定 <see cref="CardInstance.EffectiveKreditCost"/> 的下限要不要放开到 0。
     /// </summary>
     public bool KreditCostSetsAbsoluteValue { get; set; }
@@ -754,7 +826,9 @@ public sealed class CardBuff
     public bool Temporary { get; set; }
 
     public bool IsEmpty => Attack == 0 && Defense == 0 && KreditCost == 0
-                           && OperationCost == 0 && HeavyArmor == 0;
+                           && OperationCost == 0 && HeavyArmor == 0
+                           && !KreditCostSetsAbsoluteValue
+                           && !OperationCostSetsAbsoluteValue;
 
     /// <summary>
     /// 深拷贝 —— `CardApi.SuppressUnit` 要把这条 buff 整个摘走、并在解除时原样装回，
@@ -770,6 +844,7 @@ public sealed class CardBuff
         OperationCost = OperationCost,
         HeavyArmor = HeavyArmor,
         KreditCostSetsAbsoluteValue = KreditCostSetsAbsoluteValue,
+        OperationCostSetsAbsoluteValue = OperationCostSetsAbsoluteValue,
         Duration = Duration,
         Temporary = Temporary,
     };
@@ -800,6 +875,11 @@ public sealed record CardSnapshot(
 {
     public bool HasBeenAttackedThisTurn { get; init; }
     public int PinnedTurns { get; init; }
+    public bool IsRevealed { get; init; }
+    public bool IsSalvaged { get; init; }
+    public string? SalvageFaction { get; init; }
+    public int SalvagedCardId { get; init; }
+    public Dictionary<string, int[]> BlueprintSets { get; init; } = new(StringComparer.Ordinal);
 }
 
 /// <summary>

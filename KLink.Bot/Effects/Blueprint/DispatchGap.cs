@@ -77,6 +77,15 @@ public static class DispatchGap
                     return;
                 }
 
+                // Card-local custom events are represented as ordinary
+                // entrypoints and invoked from a small wrapper (for example
+                // `CustomEventOnCardDealDamage`). KismetVm executes these
+                // through its no-output entrypoint fallback.
+                if (step.OutParams.Count == 0 && lib.FindProgram(card, fn) is not null)
+                {
+                    return;
+                }
+
                 gaps[fn] = gaps.GetValueOrDefault(fn) + 1;
             }
         }

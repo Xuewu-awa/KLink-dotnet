@@ -1,0 +1,9 @@
+{
+  "portHttp": 5231,
+  "listenIp": "127.0.0.1",
+  "publicPortHttp": 5231,
+  "ip": "127.0.0.1",
+  "publicScheme": "http",
+  "bancheat": false,
+  "adminApiKey": ""
+}

@@ -35,14 +35,15 @@
   -->
   <PropertyGroup>
     <!--
-      优先用自包含发布产物（tem\fyserver\publish\win-x64），没有才回退到构建输出。
+      优先用自包含发布产物（vendor\fyserver\publish\win-x64），没有才回退到构建输出。
       理由：fyserver 是独立子进程，用不上启动器自带的运行时；若装配的是框架依赖版，
       目标机器没装 .NET 10 时就会"启动器能开、服务端起不来"。
-      自包含产物由 tools/build-release.ps1 生成，也可以用
+      自包含产物由 build-release.ps1 生成，也可以用
       -p:FyServerSource=<目录> 手动指定。
     -->
-    <FyServerSource Condition="'$(FyServerSource)' == '' And Exists('$(MSBuildThisFileDirectory)..\..\tem\fyserver\publish\win-x64\fyserver.exe')">$(MSBuildThisFileDirectory)..\..\tem\fyserver\publish\win-x64</FyServerSource>
-    <FyServerSource Condition="'$(FyServerSource)' == ''">$(MSBuildThisFileDirectory)..\..\tem\fyserver\bin\$(Configuration)\net10.0</FyServerSource>
+    <FyServerSource Condition="'$(FyServerSource)' == '' And Exists('$(MSBuildThisFileDirectory)..\vendor\fyserver\publish\win-x64\fyserver.exe') And Exists('$(MSBuildThisFileDirectory)..\vendor\fyserver\publish\win-x64\KLink.Bot.dll') And Exists('$(MSBuildThisFileDirectory)..\vendor\fyserver\publish\win-x64\BotData\card-vectors.json')">$(MSBuildThisFileDirectory)..\vendor\fyserver\publish\win-x64</FyServerSource>
+    <FyServerSource Condition="'$(FyServerSource)' == '' And Exists('$(MSBuildThisFileDirectory)..\vendor\fyserver\bin\$(Configuration)\net10.0\BotData\card-vectors.json')">$(MSBuildThisFileDirectory)..\vendor\fyserver\bin\$(Configuration)\net10.0</FyServerSource>
+    <FyServerSource Condition="'$(FyServerSource)' == ''">$(MSBuildThisFileDirectory)..\vendor\fyserver\bin\Release\net10.0</FyServerSource>
     <!--
       显式拼出输出目录：$(OutDir) / $(TargetDir) 在 AfterTargets="Build" 之前求值，
       此时还不含 TFM 子目录，会把文件拷到项目目录下的 data\fyserver（踩过一次）。
@@ -70,6 +71,7 @@
     <Exec Command="xcopy &quot;$(FyServerSource)\library&quot; &quot;$(FyServerTarget)library\&quot; /E /I /Y /Q" ContinueOnError="true" />
     <Exec Command="xcopy &quot;$(FyServerSource)\config&quot; &quot;$(FyServerTarget)config\&quot; /E /I /Y /Q" ContinueOnError="true" />
     <Exec Command="xcopy &quot;$(FyServerSource)\wwwroot&quot; &quot;$(FyServerTarget)wwwroot\&quot; /E /I /Y /Q" ContinueOnError="true" />
+    <Exec Command="xcopy &quot;$(FyServerSource)\BotData&quot; &quot;$(FyServerTarget)BotData\&quot; /E /I /Y /Q" Condition="Exists('$(FyServerSource)\BotData')" />
     <Message Importance="high" Text="fyserver 已装配到 $(FyServerTarget)" />
   </Target>
 
@@ -93,6 +95,7 @@
     <Exec Command="xcopy &quot;$(FyServerSource)\library&quot; &quot;$(PublishDir)data\fyserver\library\&quot; /E /I /Y /Q" ContinueOnError="true" />
     <Exec Command="xcopy &quot;$(FyServerSource)\config&quot; &quot;$(PublishDir)data\fyserver\config\&quot; /E /I /Y /Q" ContinueOnError="true" />
     <Exec Command="xcopy &quot;$(FyServerSource)\wwwroot&quot; &quot;$(PublishDir)data\fyserver\wwwroot\&quot; /E /I /Y /Q" ContinueOnError="true" />
+    <Exec Command="xcopy &quot;$(FyServerSource)\BotData&quot; &quot;$(PublishDir)data\fyserver\BotData\&quot; /E /I /Y /Q" Condition="Exists('$(FyServerSource)\BotData')" />
     <Message Importance="high" Text="fyserver 已装配到发布目录 $(PublishDir)data\fyserver\" />
   </Target>
 

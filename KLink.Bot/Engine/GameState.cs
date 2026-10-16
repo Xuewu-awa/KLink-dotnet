@@ -19,6 +19,16 @@ public sealed class GameState
         public int TurnsRemaining { get; set; }
     }
 
+    public sealed class GameplaySideEffect
+    {
+        public required Side Side { get; init; }
+        public required string Tag { get; init; }
+        public required int SourceCardId { get; init; }
+        public required int DurationPolicy { get; set; }
+        public int TurnsRemaining { get; set; }
+        public int EffectValue { get; init; }
+    }
+
     /// <summary>左/右两侧，索引 1/2（与 <see cref="Side"/> 对齐，0 位弃用）。</summary>
     private readonly List<CardInstance>[] _cardsBySide = { new(), new(), new() };
 
@@ -57,6 +67,48 @@ public sealed class GameState
     /// multiple sources of the same type may coexist.
     /// </summary>
     public List<GameplayRestriction> GameplayRestrictions { get; } = new();
+
+    public List<GameplaySideEffect> GameplaySideEffects { get; } = new();
+
+    public bool HasGameplaySideEffect(Side side, string tag)
+        => GameplaySideEffects.Any(x => x.Side == side
+            && string.Equals(x.Tag, tag, StringComparison.Ordinal));
+
+    public void ApplyGameplaySideEffect(Side side, string tag, int sourceCardId,
+        int durationPolicy, int turnsRemaining, int effectValue = 0)
+    {
+        var existing = GameplaySideEffects.FirstOrDefault(x => x.Side == side
+            && x.SourceCardId == sourceCardId
+            && string.Equals(x.Tag, tag, StringComparison.Ordinal));
+        if (existing is not null)
+        {
+            existing.DurationPolicy = durationPolicy;
+            existing.TurnsRemaining = turnsRemaining;
+            return;
+        }
+
+        GameplaySideEffects.Add(new GameplaySideEffect
+        {
+            Side = side,
+            Tag = tag,
+            SourceCardId = sourceCardId,
+            DurationPolicy = durationPolicy,
+            TurnsRemaining = turnsRemaining,
+            EffectValue = effectValue,
+        });
+    }
+
+    public void RemoveGameplaySideEffect(Side side, string tag, int sourceCardId)
+        => GameplaySideEffects.RemoveAll(x => x.Side == side && x.SourceCardId == sourceCardId
+            && string.Equals(x.Tag, tag, StringComparison.Ordinal));
+
+    /// <summary>
+    /// 卡牌蓝图的延迟触发队列（<c>AddToTriggerQueue</c>）。
+    ///
+    /// 这是对局状态而不是派发器状态：卡牌效果可以先把卡加入队列，
+    /// 在一次手牌选择链结束后由 <c>ResolveTriggerQueue</c> 按 FIFO 执行。
+    /// </summary>
+    public List<CardInstance> TriggerQueue { get; } = new();
 
     public bool HasGameplayRestriction(Side side, GameplayRestrictionType type)
         => GameplayRestrictions.Any(x => x.Side == side && x.Type == type && x.TurnsRemaining != 0);
@@ -105,10 +157,76 @@ public sealed class GameState
     public Side ActiveSide { get; set; } = Side.Left;
     public Side StartingSide { get; set; } = Side.Left;
 
+    /// <summary>Blueprint `DestroyedCardIDsByTurnNumber`, indexed by battle turn.</summary>
+    public Dictionary<int, List<int>> DestroyedCardIdsByTurn { get; } = new();
+
+    /// <summary>Blueprint `UnitDestroyedThisTurn`.</summary>
+    public bool UnitDestroyedThisTurn { get; private set; }
+
+    public IReadOnlyList<int> DestroyedCardsIdsByTurn(int turn)
+        => DestroyedCardIdsByTurn.TryGetValue(turn, out var ids)
+            ? ids
+            : Array.Empty<int>();
+
+    public void RecordDestroyedCard(int cardId, bool isUnit)
+    {
+        if (!DestroyedCardIdsByTurn.TryGetValue(Turn, out var ids))
+        {
+            ids = new List<int>();
+            DestroyedCardIdsByTurn[Turn] = ids;
+        }
+
+        if (!ids.Contains(cardId))
+        {
+            ids.Add(cardId);
+        }
+
+        if (isUnit)
+        {
+            UnitDestroyedThisTurn = true;
+        }
+    }
+
+    public void ResetDestroyedThisTurn() => UnitDestroyedThisTurn = false;
+
     public int Kredits(Side s) => _kredits[(int)s];
     public int MaxKredits(Side s) => _maxKredits[(int)s];
     private readonly int[] _kredits = new int[3];
     private readonly int[] _maxKredits = new int[3];
+
+    // Blueprint BP_GameState_Battle keeps these counters outside the card
+    // objects: HQ damage is tracked per side, while operation spend is one
+    // match-wide value for the active turn.
+    private readonly int[] _hqDamagedThisTurn = new int[3];
+    public int OperationKreditsSpentThisTurn { get; private set; }
+
+    public int GetHQDamagedAmountThisTurn(Side side)
+        => side is Side.Left or Side.Right ? _hqDamagedThisTurn[(int)side] : 0;
+
+    public void UpdateHQDamagedAmountThisTurn(Side side, int amount)
+    {
+        if (side is Side.Left or Side.Right)
+        {
+            _hqDamagedThisTurn[(int)side] += amount;
+        }
+    }
+
+    public void AddOperationKreditsSpentThisTurn(int amount)
+        => OperationKreditsSpentThisTurn += amount;
+
+    public void ResetTurnGameplayCounters()
+    {
+        Array.Clear(_hqDamagedThisTurn);
+        OperationKreditsSpentThisTurn = 0;
+    }
+
+    /// <summary>Blueprint <c>hasPlayedWeatherCardThisTurn</c>。</summary>
+    public bool HasPlayedWeatherCardThisTurn { get; private set; }
+
+    public bool CanPlayWeatherCard() => !HasPlayedWeatherCardThisTurn;
+
+    public void SetHasPlayedWeatherCardThisTurn(bool value)
+        => HasPlayedWeatherCardThisTurn = value;
 
     /// <summary>疲劳计数（牌库空后每次抽牌递增）。</summary>
     private readonly int[] _fatigue = new int[3];
@@ -442,6 +560,21 @@ public sealed class GameState
 
     public int HqDefense(Side s) => Hq(s).Defense;
 
+    /// <summary>
+    /// Blueprint `GetMainFactionBySide`: the match HQ definition carries the
+    /// side's main faction. Invalid sides map to EFactionEnum::NotAvailable.
+    /// </summary>
+    public int GetMainFactionBySide(Side side)
+    {
+        if (side is not (Side.Left or Side.Right))
+        {
+            return 0;
+        }
+
+        CardInstance hq = Hq(side);
+        return hq.Definition.IsLocationCard ? hq.Definition.FactionId : 0;
+    }
+
     /// <summary>创建一张卡并加入牌库。用于开局发牌与效果生成的卡（SpawnCard 等）。</summary>
     /// <param name="sequentialId">
     /// true 时用**顺序号**（左 2../右 42..）而不是客户端的 `1000×回合+序号` 规则。
@@ -450,7 +583,9 @@ public sealed class GameState
     /// （理由见 <see cref="NextCardId"/> 的长注释）。
     /// </param>
     public CardInstance Create(string cardName, Side owner, CardLocation location, int locationNumber,
-                               bool isGold = false, bool sequentialId = false)
+                               bool isGold = false, bool sequentialId = false,
+                               bool isSalvaged = false, string? salvageFaction = null,
+                               int salvagedCardId = 0)
     {
         CardDefinition def = Database.Require(cardName);
         var card = new CardInstance
@@ -478,8 +613,12 @@ public sealed class GameState
             CardId = sequentialId ? NextSequentialCardId(owner) : NextCardId(owner),
             Name = cardName,
             Owner = owner,
+            OriginalOwner = owner,
             Definition = def,
             IsGold = isGold,
+            IsSalvaged = isSalvaged,
+            SalvageFaction = salvageFaction,
+            SalvagedCardId = salvagedCardId,
             Location = location,
             LocationNumber = locationNumber,
             Attack = def.Attack,
@@ -511,95 +650,7 @@ public sealed class GameState
             GeneratedCardIds.Add(card.CardId);
         }
 
-        TraceHandChange(card, CardLocation.NotAvailable, location, "Create");
         return card;
-    }
-
-    /// <summary>
-    /// 诊断（env 门控）：手牌**进出流水账** —— 用来定位「手牌对不上」。
-    ///
-    /// 两种模式：
-    /// <list type="bullet">
-    /// <item><c>KLINK_TRACE_HANDOVER=1</c>：只在手牌**超过容量**时报一行（带调用栈）。</item>
-    /// <item><c>KLINK_TRACE_HAND=1</c>：**每一次**进/出手牌都报一行（带调用栈）——
-    ///   用来和动作流逐条对账。</item>
-    /// </list>
-    ///
-    /// ⚠️ **「手牌 &gt; 9」本身不是 bug 判据**（2026-10-04 更正）：手牌上限确实是
-    /// <see cref="HandCapacity"/> = 9（蓝图 `FetchCardsByLocation` case 3,4 → `IntConst(9)`），
-    /// 但蓝图只在**特定几道门**上查容量 —— `DrawSpecificCardFromDeckBySide`
-    /// （`BP_CardFunctions.g.cs:12406`，全函数 33 行）**根本没有门**，越界是**允许**的。
-    /// ⇒ 要判某一次进手是不是"多进了一张"，必须**先看该路径在蓝图里有没有门**
-    ///   （逐条对账表见 README §8.15）。
-    ///
-    /// 用法：`$env:KLINK_TRACE_HAND='1'`（或 `KLINK_TRACE_HANDOVER='1'`），然后跑 `--audit-replay`。
-    /// </summary>
-    private void TraceHandChange(CardInstance card, CardLocation oldLocation, CardLocation location,
-                                 string how)
-    {
-        bool overflowOnly = Environment.GetEnvironmentVariable("KLINK_TRACE_HANDOVER") == "1";
-        bool traceAll = Environment.GetEnvironmentVariable("KLINK_TRACE_HAND") == "1";
-        bool traceDeck = Environment.GetEnvironmentVariable("KLINK_TRACE_DECK") == "1";
-        if (!overflowOnly && !traceAll && !traceDeck)
-        {
-            return;
-        }
-
-        bool into = location == CardLocation.HandLeft || location == CardLocation.HandRight;
-        bool from = oldLocation == CardLocation.HandLeft || oldLocation == CardLocation.HandRight;
-        bool intoDeck = location == CardLocation.DeckLeft || location == CardLocation.DeckRight;
-        bool fromDeck = oldLocation == CardLocation.DeckLeft || oldLocation == CardLocation.DeckRight;
-
-        if (!into && !from && !intoDeck && !fromDeck)
-        {
-            return;
-        }
-
-        // 调用点都在 `card.Location` 已经改完之后 ⇒ 这个计数就是"变化**之后**的张数"
-        // （出手/出库那条路：`Cards(owner, oldLocation)` 已经不含这张卡了）。
-        int n = Cards(card.Owner, into ? location : intoDeck ? location : oldLocation).Count;
-
-        if (overflowOnly && !(into && n > HandCapacity))
-        {
-            return;
-        }
-
-        if (!overflowOnly && !traceAll && traceDeck)
-        {
-            // 只看牌库模式：手牌那两条不动（避免噪声）
-            if (!intoDeck && !fromDeck)
-            {
-                return;
-            }
-
-            if (!traceAll)
-            {
-                Console.Error.WriteLine(
-                    $"[DECK] t={Turn} {card.Owner} {oldLocation}->{location} 牌库={n} " +
-                    $"{card.Name}#{card.CardId} via {how}");
-                DumpFrames();
-                return;
-            }
-        }
-
-        Console.Error.WriteLine(
-            $"[HAND] t={Turn} {card.Owner} {oldLocation}->{location} 手牌={n}/{HandCapacity} " +
-            $"{card.Name}#{card.CardId} via {how}");
-        DumpFrames();
-    }
-
-    /// <summary>诊断用：打印前几帧 KLink 调用栈（点名"是哪条原语做的"）。</summary>
-    private static void DumpFrames()
-    {
-        var frames = Environment.StackTrace
-            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
-            .Where(f => f.Contains("KLink", StringComparison.Ordinal))
-            .Skip(2)   // 跳过本方法与 TraceHandChange
-            .Take(4);
-        foreach (string f in frames)
-        {
-            Console.Error.WriteLine($"            {f.Trim()}");
-        }
     }
 
     /// <summary>
@@ -610,7 +661,9 @@ public sealed class GameState
     /// 后续动作全是按这些 ID 引用的。
     /// </summary>
     public CardInstance CreateWithId(string cardName, Side owner, int cardId, CardLocation location,
-                                     int locationNumber, bool isGold = false)
+                                     int locationNumber, bool isGold = false,
+                                     bool isSalvaged = false, string? salvageFaction = null,
+                                     int salvagedCardId = 0)
     {
         if (_byCardId.ContainsKey(cardId))
         {
@@ -623,8 +676,12 @@ public sealed class GameState
             CardId = cardId,
             Name = cardName,
             Owner = owner,
+            OriginalOwner = owner,
             Definition = def,
             IsGold = isGold,
+            IsSalvaged = isSalvaged,
+            SalvageFaction = salvageFaction,
+            SalvagedCardId = salvagedCardId,
             Location = location,
             LocationNumber = locationNumber,
             Attack = def.Attack,
@@ -769,7 +826,8 @@ public sealed class GameState
     }
 
     /// <summary>把卡移动到新位置，并重排目标位置的 location_number（与客户端语义一致）。</summary>
-    public void Move(CardInstance card, CardLocation location, int? locationNumber = null)
+    public void Move(CardInstance card, CardLocation location, int? locationNumber = null,
+                     bool changeOwner = false)
     {
         CardLocation oldLocation = card.Location;
         bool moved = oldLocation != location;
@@ -790,10 +848,8 @@ public sealed class GameState
         //    同区重排（改 locationNumber）不走它。
         if (moved)
         {
-            CardMoved?.Invoke(card, oldLocation, location);
+            CardMoved?.Invoke(card, oldLocation, location, changeOwner);
         }
-
-        TraceHandChange(card, oldLocation, location, "Move");
     }
 
     /// <summary>
@@ -801,7 +857,26 @@ public sealed class GameState
     /// <c>OnOtherCardLocationMoved</c> 上）。
     /// GameState 不认识 CardApi，所以只留一个钩子。
     /// </summary>
-    public Action<CardInstance, CardLocation, CardLocation>? CardMoved { get; set; }
+    public Action<CardInstance, CardLocation, CardLocation, bool>? CardMoved { get; set; }
+
+    /// <summary>
+    /// 改变当前控制方，同时维护按阵营索引。位置本身由调用方随后通过
+    /// <see cref="Move"/> 更新，这样换区触发器仍能看到旧位置。
+    /// </summary>
+    public bool ChangeOwner(CardInstance card, Side newOwner)
+    {
+        if (newOwner is Side.NotAvailable || card.Owner == newOwner)
+        {
+            return false;
+        }
+
+        Side oldOwner = card.Owner;
+        _cardsBySide[(int)oldOwner].Remove(card);
+        card.Owner = newOwner;
+        _cardsBySide[(int)newOwner].Add(card);
+        NormalizeLocationNumbers(oldOwner, card.Location);
+        return true;
+    }
 
     /// <summary>卡对象被创建时的回调（对应蓝图 <c>CreateCardObject</c> 里的 <c>OnCreateCard</c>）。</summary>
     public Action<CardInstance>? CardCreated { get; set; }
@@ -855,10 +930,16 @@ public sealed class GameState
         {
             LeftKreditSlotsLost = KreditSlotsLost(Side.Left),
             RightKreditSlotsLost = KreditSlotsLost(Side.Right),
+            LeftHQDamagedThisTurn = GetHQDamagedAmountThisTurn(Side.Left),
+            RightHQDamagedThisTurn = GetHQDamagedAmountThisTurn(Side.Right),
+            OperationKreditsSpentThisTurn = OperationKreditsSpentThisTurn,
+            HasPlayedWeatherCardThisTurn = HasPlayedWeatherCardThisTurn,
             FrontlineLimiterIds = FrontlineLimiters.OrderBy(id => id).ToArray(),
             // Preserve list order: future dispatch can depend on insertion order.
             Restrictions = GameplayRestrictions.Select(x => new GameplayRestrictionSnapshot(
                 x.Side, x.Type, x.SourceCardId, x.TurnsRemaining)).ToArray(),
+            SideEffects = GameplaySideEffects.Select(x => new GameplaySideEffectSnapshot(
+                x.Side, x.Tag, x.SourceCardId, x.DurationPolicy, x.TurnsRemaining, x.EffectValue)).ToArray(),
         };
 
     public string SnapshotJson() => System.Text.Json.JsonSerializer.Serialize(
@@ -904,12 +985,20 @@ public sealed record MatchSnapshot(
 {
     public int LeftKreditSlotsLost { get; init; }
     public int RightKreditSlotsLost { get; init; }
+    public int LeftHQDamagedThisTurn { get; init; }
+    public int RightHQDamagedThisTurn { get; init; }
+    public int OperationKreditsSpentThisTurn { get; init; }
+    public bool HasPlayedWeatherCardThisTurn { get; init; }
     public int[] FrontlineLimiterIds { get; init; } = Array.Empty<int>();
     public GameplayRestrictionSnapshot[] Restrictions { get; init; } = Array.Empty<GameplayRestrictionSnapshot>();
+    public GameplaySideEffectSnapshot[] SideEffects { get; init; } = Array.Empty<GameplaySideEffectSnapshot>();
 }
 
 public sealed record GameplayRestrictionSnapshot(Side Side, GameplayRestrictionType Type,
     int SourceCardId, int TurnsRemaining);
+
+public sealed record GameplaySideEffectSnapshot(Side Side, string Tag, int SourceCardId,
+    int DurationPolicy, int TurnsRemaining, int EffectValue);
 
 /// <summary>一条已结算的动作 —— 与协议里的 action 信封对应。</summary>
 public sealed record GameAction(

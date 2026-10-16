@@ -60,6 +60,9 @@ public sealed class EffectContext
     /// <summary>触发本次结算的卡（例如「你打出某张牌时」的那个某张牌）。</summary>
     public CardInstance? Trigger { get; set; }
 
+    /// <summary>伤害等事件中的显式目标载荷（例如 OnCardDealDamage.toCard）。</summary>
+    public CardInstance? EventTarget { get; set; }
+
     /// <summary>
     /// 触发事件的**额外入参**，按顺序。
     ///
