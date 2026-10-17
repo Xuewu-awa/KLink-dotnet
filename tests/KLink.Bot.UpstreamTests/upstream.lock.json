@@ -1,0 +1,21 @@
+{
+  "repository": "https://github.com/Xuewu-awa/KLink-bot.git",
+  "commit": "89515569c036b295e14aeaa4d759d50891192b20",
+  "sources": ["Program.cs", "SelfTest.cs", "DispatchGap.cs", "GapReport.cs", "SmokeAllCards.cs"],
+  "replayFixtures": [
+    "out/_server-replays/replay-508065.json",
+    "out/_server-replays/replay-508065.actions.json",
+    "klink bot/docs/live-replays/replay-310284.json",
+    "klink bot/docs/live-replays/replay-310284.actions.json",
+    "klink bot/docs/live-replays/replay-955337.json",
+    "klink bot/docs/live-replays/replay-955337.actions.json"
+  ],
+  "data": {
+    "cards.live.json": "46027344d9637a0bb143fcb56c5eac23e7849b9d157fe7c76413b2b31d4f470b",
+    "card-effects.json": "60e28b67a0205f2fa2283fee14635ee601c4dc8d2f03a5869d1268157aadcf15",
+    "card-ir.json": "95b223d680cfd073d752e70ba12dc3edf931a0b7c4b7ba986bbdb73b6c060bbb",
+    "card-vectors.json": "b15b93cb02e7e8a712561a2da52127a5867084ecb878a6ad58539b56b1109ab9",
+    "event-contracts.json": "e4806dd48efbfc799a27c14b3660ad76ee03cd3f13e3e4320b213c5928efb112",
+    "deck_code_ids.live.json": "261cfd518c1a1ce40488f141e8dbd617ff19abe0734c49319ebcd6ac5dcb257e"
+  }
+}

@@ -14,7 +14,7 @@ namespace KLink.Bot.Effects.Blueprint;
 /// </summary>
 public sealed class KismetLibrary
 {
-    private readonly Dictionary<string, KismetCard> _cards = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, KismetCard> _cards = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>进程内共享的实例 —— 由 <see cref="Initialize"/> 首次加载。</summary>
     public static KismetLibrary? Default { get; private set; }
@@ -56,17 +56,17 @@ public sealed class KismetLibrary
     public IEnumerable<string> AllProgramNames()
     {
         _triggerIndex ??= BuildTriggerIndex();
-        return _triggerIndex.Keys.OrderBy(k => k, StringComparer.Ordinal);
+        return _triggerIndex.Keys.OrderBy(k => k, StringComparer.OrdinalIgnoreCase);
     }
 
     private Dictionary<string, List<string>> BuildTriggerIndex()
     {
-        var index = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+        var index = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
         foreach (var (cardName, card) in _cards)
         {
             foreach (string program in card.Entrypoints.Keys.Concat(card.Locals.Keys.Where(IsEventName)))
             {
-                if (program.StartsWith("OnPlayedFromHand", StringComparison.Ordinal))
+                if (program.StartsWith("OnPlayedFromHand", StringComparison.OrdinalIgnoreCase))
                 {
                     continue;   // 主动打出，不是触发
                 }
@@ -162,7 +162,7 @@ public sealed class KismetLibrary
 
             if (!_programCache.TryGetValue(candidate, out var perCard))
             {
-                perCard = new Dictionary<string, KismetProgram>(StringComparer.Ordinal);
+                perCard = new Dictionary<string, KismetProgram>(StringComparer.OrdinalIgnoreCase);
                 _programCache[candidate] = perCard;
             }
 
@@ -184,11 +184,11 @@ public sealed class KismetLibrary
     /// 而重建前导是 O(语句数)。不缓存的话这里会变成整局最热的地方。
     /// </remarks>
     private readonly Dictionary<string, Dictionary<string, KismetProgram>> _programCache =
-        new(StringComparer.Ordinal);
+        new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>卡名 → (局部函数名 → 程序)。见 <see cref="FindLocalProgram"/>。</summary>
     private readonly Dictionary<string, Dictionary<string, KismetProgram>> _localCache =
-        new(StringComparer.Ordinal);
+        new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// 取一张卡**自己的局部函数**（例如 <c>GetPlayFromHandDamage</c>）编成的程序。
@@ -213,13 +213,17 @@ public sealed class KismetLibrary
 
             if (!_localCache.TryGetValue(candidate, out var perCard))
             {
-                perCard = new Dictionary<string, KismetProgram>(StringComparer.Ordinal);
+                perCard = new Dictionary<string, KismetProgram>(StringComparer.OrdinalIgnoreCase);
                 _localCache[candidate] = perCard;
             }
 
             if (!perCard.TryGetValue(functionName, out var program))
             {
-                program = new KismetProgram(steps, steps[0].Index);
+                program = new KismetProgram(steps, steps[0].Index)
+                {
+                    InputNames = card.LocalInputs.GetValueOrDefault(functionName),
+                    OutputNames = card.LocalOutputs.GetValueOrDefault(functionName),
+                };
                 perCard[functionName] = program;
             }
 
@@ -366,8 +370,8 @@ public sealed class KismetLibrary
 
     /// <summary>函数名看起来是不是事件（`On*`，且不是 `__DelegateSignature`）。</summary>
     private static bool IsEventName(string name)
-        => name.StartsWith("On", StringComparison.Ordinal)
-           && !name.EndsWith("__DelegateSignature", StringComparison.Ordinal);
+        => name.StartsWith("On", StringComparison.OrdinalIgnoreCase)
+           && !name.EndsWith("__DelegateSignature", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>变体回退之后的实际卡名（IR 里存的是基础卡）。</summary>
     public string? ResolveCardName(string cardName)
@@ -392,7 +396,7 @@ public sealed class KismetLibrary
         yield return cardName;
 
         string baseName = Cards.CardDatabase.ResolveBaseName(cardName);
-        if (!string.Equals(baseName, cardName, StringComparison.Ordinal))
+        if (!string.Equals(baseName, cardName, StringComparison.OrdinalIgnoreCase))
         {
             yield return baseName;
         }
@@ -410,7 +414,7 @@ public sealed class KismetLibrary
 
         foreach (var cardProp in doc.RootElement.EnumerateObject())
         {
-            var entries = new Dictionary<string, int>(StringComparer.Ordinal);
+            var entries = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             if (cardProp.Value.TryGetProperty("entrypoints", out var epEl))
             {
                 foreach (var ep in epEl.EnumerateObject())
@@ -431,7 +435,7 @@ public sealed class KismetLibrary
             // 卡自己的局部函数（`locals`）。见 gen-kismet-ir.py 的 LOCAL_FUNCTIONS：
             // 这些是**独立 export**，语句下标从 0 开始，与 ubergraph 的 StatementIndex
             // 不共享命名空间 —— 所以单独存，绝不能拼进 `steps`（拼进去跳转目标会串）。
-            var locals = new Dictionary<string, IReadOnlyList<KismetStep>>(StringComparer.Ordinal);
+            var locals = new Dictionary<string, IReadOnlyList<KismetStep>>(StringComparer.OrdinalIgnoreCase);
             if (cardProp.Value.TryGetProperty("locals", out var localsEl)
                 && localsEl.ValueKind == JsonValueKind.Object)
             {
@@ -450,9 +454,39 @@ public sealed class KismetLibrary
                 }
             }
 
+            var inputs = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
+            if (cardProp.Value.TryGetProperty("local_inputs", out var inputsEl))
+            {
+                foreach (var fn in inputsEl.EnumerateObject())
+                    inputs[fn.Name] = fn.Value.EnumerateArray().Select(p => p.GetString()!).ToArray();
+            }
+
+            var outputs = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
+            if (cardProp.Value.TryGetProperty("local_outputs", out var outputsEl))
+            {
+                foreach (var fn in outputsEl.EnumerateObject())
+                    outputs[fn.Name] = fn.Value.EnumerateArray().Select(p => p.GetString()!).ToArray();
+            }
+
+            var defaults = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            if (cardProp.Value.TryGetProperty("instance_defaults", out var defaultsEl))
+                foreach (var member in defaultsEl.EnumerateObject())
+                    defaults[member.Name] = member.Value.ValueKind switch
+                    {
+                        JsonValueKind.True => true,
+                        JsonValueKind.False => false,
+                        JsonValueKind.String => member.Value.GetString(),
+                        JsonValueKind.Number when member.Value.TryGetInt32(out var integer) => integer,
+                        JsonValueKind.Number => member.Value.GetDouble(),
+                        _ => null,
+                    };
+
             library._cards[cardProp.Name] = new KismetCard(cardProp.Name, entries, steps)
             {
                 Locals = locals,
+                LocalInputs = inputs,
+                LocalOutputs = outputs,
+                InstanceDefaults = defaults,
             };
         }
 
@@ -503,7 +537,12 @@ public sealed class KismetLibrary
         KismetExpr? cond = s.TryGetProperty("cond", out var condEl) ? ParseExpr(condEl) : null;
         KismetExpr? recv = s.TryGetProperty("recv", out var recvEl) ? ParseExpr(recvEl) : null;
 
-        return new KismetStep(index, op, fn, args, outs, src, cond, to, dst, inst) { Receiver = recv, ByteOffset = offset };
+        return new KismetStep(index, op, fn, args, outs, src, cond, to, dst, inst)
+        {
+            Receiver = recv, ByteOffset = offset,
+            DestinationScope = s.TryGetProperty("dst_scope", out var ds) && ds.ValueKind == JsonValueKind.String
+                ? ds.GetString() : null,
+        };
     }
 
     private static KismetExpr ParseExpr(JsonElement el)
@@ -555,6 +594,8 @@ public sealed class KismetLibrary
         return new KismetExpr
         {
             Var = var, Call = call, Math = math, Str = str, Obj = obj,
+            Scope = el.TryGetProperty("scope", out var scope) ? scope.GetString() : null,
+            ElementType = el.TryGetProperty("element_type", out var et) ? et.GetString() : null,
             Name = name, Unknown = unknown, Prop = prop,
             Int = intVal, Float = floatVal, Bool = boolVal,
             Self = self, None = none, Args = args, Array = array, Context = ctx,
@@ -565,6 +606,8 @@ public sealed class KismetLibrary
 
 public sealed record KismetCard(string Name, IReadOnlyDictionary<string, int> Entrypoints, IReadOnlyList<KismetStep> Steps)
 {
+    public IReadOnlyDictionary<string, object?> InstanceDefaults { get; init; } =
+        new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
     /// <summary>该卡注册了哪些事件（入口名）。</summary>
     public IEnumerable<string> ProgramNames => Entrypoints.Keys;
 
@@ -572,14 +615,24 @@ public sealed record KismetCard(string Name, IReadOnlyDictionary<string, int> En
     /// 卡自己的**局部函数**（不是事件）的语句表，函数名 → 步骤。
     ///
     /// 这些函数编译成独立 export、**不在 ubergraph 里**，所以既不是入口点、
-    /// 也不在 <see cref="Steps"/> 里。目前只收了 <c>GetPlayFromHandDamage</c>
-    /// （见 <c>klink bot/tools/gen-kismet-ir.py</c> 的 <c>LOCAL_FUNCTIONS</c>）。
+    /// 也不在 <see cref="Steps"/> 里。生成器收录非 UI 的独立函数及参数顺序。
     /// </summary>
     public IReadOnlyDictionary<string, IReadOnlyList<KismetStep>> Locals { get; init; } =
-        new Dictionary<string, IReadOnlyList<KismetStep>>(StringComparer.Ordinal);
+        new Dictionary<string, IReadOnlyList<KismetStep>>(StringComparer.OrdinalIgnoreCase);
+
+    public IReadOnlyDictionary<string, IReadOnlyList<string>> LocalInputs { get; init; } =
+        new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
+    public IReadOnlyDictionary<string, IReadOnlyList<string>> LocalOutputs { get; init; } =
+        new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
 }
 
-public sealed record KismetProgram(IReadOnlyList<KismetStep> Steps, int Entry);
+public sealed record KismetProgram(IReadOnlyList<KismetStep> Steps, int Entry)
+{
+    /// <summary>Formal input parameter order from the current FunctionExport; null for legacy IR.</summary>
+    public IReadOnlyList<string>? InputNames { get; init; }
+    /// <summary>Formal output order; generated caller slots may carry numeric suffixes.</summary>
+    public IReadOnlyList<string>? OutputNames { get; init; }
+}
 
 public sealed record KismetStep(
     int Index,
@@ -598,6 +651,7 @@ public sealed record KismetStep(
     /// <c>Context(card) → IsUnit(out isIt)</c>），主语就在这个字段里。
     /// </summary>
     public KismetExpr? Receiver { get; init; }
+    public string? DestinationScope { get; init; }
 
     /// <summary>
     /// 字节码偏移（IR 的 <c>bo</c>）。
@@ -615,6 +669,7 @@ public sealed record KismetStep(
 public sealed class KismetExpr
 {
     public string? Var { get; init; }
+    public string? Scope { get; init; }
     public string? Call { get; init; }
     public string? Math { get; init; }
     public string? Str { get; init; }
@@ -622,6 +677,8 @@ public sealed class KismetExpr
     public string? Name { get; init; }
     public string? Unknown { get; init; }
     public string? Prop { get; init; }
+    /// <summary>Array element category from the serialized Blueprint property.</summary>
+    public string? ElementType { get; init; }
 
     /// <summary>
     /// 结构体常量的类型名（实测只有 <c>/Script/GameplayTags.GameplayTag</c>）。

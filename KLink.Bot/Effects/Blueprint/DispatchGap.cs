@@ -61,32 +61,40 @@ public static class DispatchGap
 
             void Count(string card, KismetStep step)
             {
-                if (!string.Equals(step.Op, "call", StringComparison.Ordinal)
-                    || step.Function is not { } fn)
+                if (step.Op == "call" && step.Function is { } fn)
+                    CountCall(fn, step.OutParams.Count == 0, step.Receiver is null || step.Receiver.Self);
+                if (step.Op == "math" && step.Function is { } math)
+                    CountMath(math);
+                Visit(step.Source);
+                Visit(step.Condition);
+                Visit(step.Receiver);
+                foreach (var arg in step.Args) Visit(arg);
+
+                void CountCall(string name, bool entrypointFallback, bool selfCall)
                 {
-                    return;
+                    if (name is "Map_Find" or "GetDataTableRowFromName"
+                        || implemented.Contains(name)
+                        || selfCall && lib.FindLocalProgram(card, name) is not null
+                        || selfCall && entrypointFallback && lib.FindProgram(card, name) is not null) return;
+                    gaps[name] = gaps.GetValueOrDefault(name) + 1;
                 }
 
-                if (implemented.Contains(fn))
+                void CountMath(string name)
                 {
-                    return;
+                    if (KismetVm.ImplementedMathNames.Contains(name)) return;
+                    string key = "math:" + name;
+                    gaps[key] = gaps.GetValueOrDefault(key) + 1;
                 }
 
-                if (lib.FindLocalProgram(card, fn) is not null)
+                void Visit(KismetExpr? expression)
                 {
-                    return;
+                    if (expression is null) return;
+                    if (expression.Call is { } call) CountCall(call, false, expression.Context is null || expression.Context.Self);
+                    if (expression.Math is { } math) CountMath(math);
+                    Visit(expression.Context);
+                    foreach (var arg in expression.Args) Visit(arg);
+                    foreach (var item in expression.Array) Visit(item);
                 }
-
-                // Card-local custom events are represented as ordinary
-                // entrypoints and invoked from a small wrapper (for example
-                // `CustomEventOnCardDealDamage`). KismetVm executes these
-                // through its no-output entrypoint fallback.
-                if (step.OutParams.Count == 0 && lib.FindProgram(card, fn) is not null)
-                {
-                    return;
-                }
-
-                gaps[fn] = gaps.GetValueOrDefault(fn) + 1;
             }
         }
 

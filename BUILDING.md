@@ -40,8 +40,10 @@ Set-Location "$workspace\KLink-dotnet"
 
 第三个 fyserver checkout 不需要创建：源码已随 KLink-dotnet 位于
 `vendor\fyserver`。要复现当前集成结果，还应记录并检出本次使用的 KLink-bot
-commit；不要假定两个仓库的 `main` 永远同步。当前最新独立 Bot 验证使用的是
-`89515569c036b295e14aeaa4d759d50891192b20`。
+commit；不要假定两个仓库的 `main` 永远同步。当前集成内核基于
+`89515569c036b295e14aeaa4d759d50891192b20`，并补充了 Bot 手牌选择器优先于
+回放 HT 读取器的修复。重放结束后继续决策时，Gordon Highlanders 等卡现在可以
+正常选择手牌、执行效果并发送 HT 答复。
 
 ## 2. 环境要求
 
@@ -87,7 +89,7 @@ dotnet build vendor\fyserver\fyserver.csproj -c Release `
 
 至少需要 `cards.live.json`、`card-effects.json`、`card-ir.json`、
 `card-vectors.json` 和 `deck_code_ids.live.json`。规则内核项目还会复制
-`event-contracts.json`（如果存在）。输入 JSON 会被复制到构建输出的 `Data/` 或
+`event-contracts.json`。输入 JSON 会被复制到构建输出的 `Data/` 或
 `BotData/`；修改数据后应重新构建，避免继续使用旧副本。
 
 如果要构建独立的 KLink-bot，从它自己的仓库根目录运行：
@@ -102,6 +104,37 @@ dotnet run --project tools/BotSim/BotSim.csproj `
 
 当前最新远端 Bot checkout 的 selftest 实测为 530/530；这个数字会随数据和测试
 增加而变化，运行命令的退出码和最终通过数才是本次 checkout 的验证结果。
+
+本仓库的补充回归直接引用集成后的 `KLink.Bot` 项目，覆盖 Bot 手牌选择与历史
+HT 答复的优先级、空目标和非法目标、物理位置邻卡查询、老兵晋升、临时增益撤销、
+回合结束清理、抑制与回手重置、射程/放逐阵营实例值、蓝图成员读取、生成顺序，
+以及贪心/神经网络服务端动作的重放：
+
+```powershell
+dotnet run --project tests/KLink.Bot.RegressionTests/KLink.Bot.RegressionTests.csproj `
+  -c Release -p:BotDataRoot=$botData -p:NuGetAudit=false
+```
+
+其中 `$botData` 应指向上述固定 Bot 版本的 `klink bot/docs`。测试使用随项目复制的
+`Data/`，不需要 `nn-model.bin`；神经网络路径使用确定的合成模型验证控制流程。
+
+老兵晋升要求存在精确的 `_vet` 模板。晋升按蓝图的 `veteranSet` 清除攻、防、行动费和
+重甲的永久数值增益，保留临时增益，并重设防御和最大防御。测试生成老兵或晋升事件时
+也必须选择有真实 `_vet` 模板的卡；旧 BotSim 中使用普通无升级卡的样本需要相应替换。
+
+完整的集成验证入口位于本仓库 `tests/Run-BotVerification.ps1`：
+
+```powershell
+pwsh -File tests/Run-BotVerification.ps1 -BotSourceRoot 'D:/checkouts/KLink-bot'
+```
+
+它从固定 commit 读取五个 BotSim 源文件和真实回放 508065 到忽略的 `obj/pinned/`，
+保留全部断言，仅应用已记录的五处老兵测试卡替换，然后引用当前集成内核运行。
+两个含真实晋升的 live 回放 310284、955337 也从同一 commit 提取，作为带 HQ
+校验的回归输入。六个数据文件须匹配
+`tests/KLink.Bot.UpstreamTests/upstream.lock.json` 的 SHA-256；数据不在 checkout
+默认路径时可传 `-BotDataRoot`。实测本地回归 25/25、固定上游自测 530/530；
+源码、数据、补丁锚点或测试失败都会使命令失败。
 
 ## 4. 构建 KLink-dotnet 启动器
 

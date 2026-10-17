@@ -42,11 +42,12 @@ public static class ServerReplayBridge
     /// 保留成参数是为了将来能复现旧口径。
     /// </param>
     /// <param name="clientSide">
-    /// **官方客户端是哪一方** —— 现在**只是诊断信息**（见 `ReplayData.ClientSide`）。
+    /// **官方客户端是哪一方** —— 会写入内核的 `GameState.ClientSide`，同时
+    /// 作为 `ReplayData.ClientSide` 保留给诊断使用。
     /// 实时对局里 bot 自己知道坐哪边（`BotTurnService.BotSide`），所以由调用方显式给
     /// **对手那一方**；不给时按玩家 id 推断（见 <see cref="ReplayData.InferClientSide"/>）。
     ///
-    /// ⚠️ **2026-10-02 起它不再影响发号**：生成卡的编号规则（`回合号 × 1000 + 第几张`）
+    /// ⚠️ **2026-10-02 起它不影响发号**：生成卡的编号规则（`回合号 × 1000 + 第几张`）
     /// 对**双方一致**（客户端分配器 `GenerateNextCardID` 没有 side 参数，见
     /// `GameState.NextCardId`）。以前只让这一方走客户端规则是错的 ——
     /// 我们 bot 生成卡发顺序号，客户端认不出 ⇒ **虚空部署**。

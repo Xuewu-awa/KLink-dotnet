@@ -90,7 +90,7 @@ public sealed partial class CardApi
         var library = Blueprint.KismetLibrary.Default;
         if (library is null)
         {
-            RemoveTemporaryBuffs();
+            RemoveBuffsEndOfTurn();
             return;
         }
 
@@ -145,7 +145,7 @@ public sealed partial class CardApi
 
         if (next.Count == 0 || recursionLoop > 5)
         {
-            RemoveTemporaryBuffs();
+            RemoveBuffsEndOfTurn();
             return;
         }
 
@@ -155,26 +155,14 @@ public sealed partial class CardApi
     private List<CardInstance> EndOfTurnRecipients(Blueprint.KismetLibrary library)
     {
         var result = new List<CardInstance>();
-        foreach (Side side in new[] { Side.Left, Side.Right })
+        foreach (var card in State.AllCards)
         {
-            foreach (var card in State.Board(side))
+            if (card.Location != CardLocation.NotAvailable
+                && card.Definition.UsedTriggers.Contains("OnEndOfTurn")
+                && !SuppressedSkipsTrigger(card, "OnEndOfTurn")
+                && library.FindProgram(card.Name, "OnEndOfTurn") is not null)
             {
-                if (card.Location != CardLocation.NotAvailable
-                    && !SuppressedSkipsTrigger(card, "OnEndOfTurn")
-                    && library.FindProgram(card.Name, "OnEndOfTurn") is not null)
-                {
-                    result.Add(card);
-                }
-            }
-
-            foreach (var card in State.Discard(side))
-            {
-                if (card.Location != CardLocation.NotAvailable
-                    && !SuppressedSkipsTrigger(card, "OnEndOfTurn")
-                    && library.FindProgram(card.Name, "OnEndOfTurn") is not null)
-                {
-                    result.Add(card);
-                }
+                result.Add(card);
             }
         }
 
@@ -196,34 +184,10 @@ public sealed partial class CardApi
                           eventArgs: new object?[] { State.Turn });
     }
 
-    // 蓝图 FetchAllCardsWithEventTrigger 的逐卡抑制例外表。
-    // 卡面 CDO 未随当前数据集导出，因此在派发层固定记录已从蓝图核实的 11 张卡。
-    private static readonly Dictionary<string, string[]> SuppressionExceptionTable =
-        new(StringComparer.Ordinal)
-        {
-            ["card_unit_1st_marines"] = new[] { "OnStartofTurn" },
-            ["card_unit_3rd_kure_snlf"] = new[] { "OnEndofTurn" },
-            ["card_unit_92nd_naval_brigade"] = new[] { "OnStartofTurn" },
-            ["card_unit_99th_kholm"] = new[] { "OnStartofTurn" },
-            ["card_unit_a20_havoc"] = new[] { "OnEndofTurn" },
-            ["card_unit_danuta"] = new[] { "OnEndofTurn" },
-            ["card_unit_gordon_highlanders"] = new[] { "OnOtherCardDrawnFromDeck" },
-            ["card_unit_infantry_regiment_36"] = new[] { "OnEndofTurn" },
-            ["card_unit_kurmark_aufklarungs"] = new[] { "OnEndofTurn" },
-            ["card_unit_kv_85"] = new[] { "OnStartofTurn" },
-            ["card_unit_panther_a"] = new[] { "OnStartofTurn" },
-        };
-
     private static bool HasSuppressionException(CardInstance card, string trigger)
-    {
-        if (card.SuppressionExceptionTriggers.Contains(trigger))
-        {
-            return true;
-        }
-
-        return SuppressionExceptionTable.TryGetValue(card.Name, out string[]? allowed)
-               && allowed.Any(x => string.Equals(x, trigger, StringComparison.OrdinalIgnoreCase));
-    }
+        // Current pak FetchAllCardsWithEventTrigger i=682 checks the instance
+        // array only. All 2019 CDO arrays have been verified against live memory.
+        => card.SuppressionExceptionTriggers.Contains(Cards.CardDefinition.RegisteredTriggerName(trigger));
 
     private static bool SuppressedSkipsTrigger(CardInstance card, string trigger)
         => card.IsSuppressed && !HasSuppressionException(card, trigger);
@@ -253,15 +217,249 @@ public sealed partial class CardApi
     /// </summary>
     public IReadOnlyList<CardInstance> CaptureTriggerSnapshot()
     {
-        var snapshot = new List<CardInstance>();
-        foreach (Side side in new[] { Side.Left, Side.Right })
-        {
-            snapshot.AddRange(State.Board(side));
-            snapshot.AddRange(State.Discard(side));
-        }
-
-        return snapshot;
+        // FetchAllCardsWithEventTrigger resolves registered IDs from the global
+        // map without hand/deck/board filtering. CardId order is deterministic;
+        // equivalence to UE TSet subscription order remains to be verified.
+        return State.AllCards;
     }
+    /// <summary>Definition-based registration and query-time suppression filter; no location gate.</summary>
+    public IReadOnlyList<CardInstance> CaptureRegisteredTriggerSnapshot(string programName)
+        => CaptureTriggerSnapshot().Where(card => card.Definition.IsRegisteredFor(programName)
+            && !SuppressedSkipsTrigger(card, programName)).ToArray();
+
+    // ExecuteOnEnterPlayEvents i=74 queries T43 after the own hook; i=343
+    // excludes only the entering ID. The saved recipients are invoked directly.
+    internal void ExecuteOtherCardEnterPlayEvents(CardInstance entered, int method)
+    {
+        const string trigger = "OnOtherCardEnterPlay";
+        var recipients = CaptureRegisteredTriggerSnapshot(trigger);
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        var args = new object?[] { entered, method };
+        var named = new Dictionary<string, object?> { ["cardPlayed"] = entered, ["Method"] = method };
+        foreach (var observer in recipients)
+        {
+            if (observer.CardId == entered.CardId || library.FindProgram(observer.Name, trigger) is null) continue;
+            TriggerTrace?.Add($"{trigger} → {observer.Name}#{observer.CardId}（eventCard={entered.Name}#{entered.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, trigger, entered, eventArgs: args, namedArgs: named);
+        }
+    }
+
+    // T68 differs from the direct snapshot loops: query allows suppression
+    // exceptions, but i=381 independently checks CURRENT suppression again.
+    public void ExecuteOnOperationKreditsSpent(CardInstance operated, int cost)
+    {
+        if (!operated.IsSuppressed)
+            FireTrigger("OnOperationKreditsSpent", operated, operated.Owner,
+                eventArgs: new object?[] { cost }, eventSubject: operated,
+                namedArgs: new Dictionary<string, object?> { ["kreditsSpent"] = cost },
+                recipientSnapshot: new[] { operated }, includeUnavailableRecipients: true);
+        const string trigger = "OnOtherCardOperationKreditsSpent";
+        var recipients = CaptureRegisteredTriggerSnapshot(trigger);
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        var args = new object?[] { operated, cost };
+        var named = new Dictionary<string, object?> { ["cardOperated"] = operated, ["kreditsSpent"] = cost };
+        foreach (var observer in recipients)
+        {
+            if (ReferenceEquals(observer, operated) || observer.IsSuppressed
+                || library.FindProgram(observer.Name, trigger) is null) continue;
+            TriggerTrace?.Add($"{trigger} → {observer.Name}#{observer.CardId}（eventCard={operated.Name}#{operated.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, trigger, operated, eventArgs: args, namedArgs: named);
+        }
+    }
+
+    // ExecuteOnMoveToFrontlineCardEffects: active Gotchas first, then own
+    // hook and T50. A shared done set prevents duplicate Gotcha callbacks.
+    public void ExecuteOnMoveToFrontlineCardEffects(CardInstance moved, bool forceMove, int moveCost)
+    {
+        State.StopFurtherActions = false;
+        var library = Blueprint.KismetLibrary.Default;
+        var done = new HashSet<int>();
+        const string trigger = "OnOtherCardMoveToFrontline";
+        var args = new object?[] { moved, forceMove, moveCost };
+        var named = new Dictionary<string, object?> {
+            ["cardMoved"] = moved, ["ForceMove"] = forceMove, ["moveCost"] = moveCost,
+        };
+        void InvokeObserver(CardInstance observer)
+        {
+            if (library?.FindProgram(observer.Name, trigger) is null) return;
+            TriggerTrace?.Add($"{trigger} → {observer.Name}#{observer.CardId}（eventCard={moved.Name}#{moved.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, trigger, moved, eventArgs: args, namedArgs: named);
+        }
+        var active = GetActiveGotchasOrdered().ToArray();
+        foreach (int id in active)
+        {
+            if (State.StopFurtherActions) return;
+            if (State.ById(id) is { } gotcha) InvokeObserver(gotcha);
+            done.Add(id);
+        }
+        if (State.StopFurtherActions || moved.Location != CardLocation.BoardFrontline) return;
+        if (!moved.IsSuppressed)
+            FireTrigger("OnMoveToFrontline", moved, moved.Owner,
+                eventArgs: new object?[] { forceMove, moveCost }, namedArgs: named,
+                recipientSnapshot: new[] { moved }, includeUnavailableRecipients: true);
+        done.Add(moved.CardId);
+        if (IsUnrevealedCovertCard(moved)) return;
+        var recipients = CaptureRegisteredTriggerSnapshot(trigger);
+        foreach (var observer in recipients)
+        {
+            if (State.StopFurtherActions) return;
+            if (done.Contains(observer.CardId)) continue;
+            InvokeObserver(observer);
+            done.Add(observer.CardId);
+        }
+    }
+
+    // AttackCard i=3590/3635 calls the unsuppressed attacker before querying T13.
+    // i=3275 excludes only the same object; saved recipients are invoked directly.
+    internal void ExecuteBeforeAttackEvents(CardInstance attacker, CardInstance defender)
+    {
+        const string own = "OnBeforeAttack", other = "OnBeforeOtherCardAttacks";
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        if (!attacker.IsSuppressed && library.FindProgram(attacker.Name, own) is not null)
+        {
+            TriggerTrace?.Add($"{own} → {attacker.Name}#{attacker.CardId}（eventCard={defender.Name}#{defender.CardId}）");
+            RunTriggerProgram(library, attacker, attacker.Name, own, defender,
+                eventArgs: new object?[] { defender },
+                namedArgs: new Dictionary<string, object?> { ["defender"] = defender });
+        }
+        var recipients = CaptureRegisteredTriggerSnapshot(other);
+        var args = new object?[] { attacker, defender };
+        var named = new Dictionary<string, object?> { ["attacker"] = attacker, ["defender"] = defender };
+        foreach (var observer in recipients)
+        {
+            if (ReferenceEquals(observer, attacker) || library.FindProgram(observer.Name, other) is null) continue;
+            TriggerTrace?.Add($"{other} → {observer.Name}#{observer.CardId}（eventCard={attacker.Name}#{attacker.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, other, attacker, eventArgs: args, namedArgs: named);
+        }
+    }
+
+    // ExecuteOnAfterAttackEvents i=440/503 runs own callback before querying T4.
+    // i=343/425 excludes the attacker's current ID; no repeated recipient gates.
+    internal void ExecuteAfterAttackEvents(CardInstance attacker, CardInstance defender,
+        int damageToDefenderFinal, bool afterShockAttack, int attackCost)
+    {
+        const string own = "OnAfterAttack", other = "OnAfterOtherCardAttacks";
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        if (!attacker.IsSuppressed && library.FindProgram(attacker.Name, own) is not null)
+        {
+            TriggerTrace?.Add($"{own} → {attacker.Name}#{attacker.CardId}（eventCard={defender.Name}#{defender.CardId}）");
+            RunTriggerProgram(library, attacker, attacker.Name, own, defender,
+                eventArgs: new object?[] { defender, afterShockAttack, attackCost },
+                namedArgs: new Dictionary<string, object?> {
+                    ["defender"] = defender, ["afterShockAttack"] = afterShockAttack, ["attackCost"] = attackCost });
+        }
+        var recipients = CaptureRegisteredTriggerSnapshot(other);
+        var args = new object?[] { defender, attacker, damageToDefenderFinal, attackCost };
+        var named = new Dictionary<string, object?> {
+            ["defender"] = defender, ["attacker"] = attacker,
+            ["damageToDefenderFinal"] = damageToDefenderFinal, ["attackCost"] = attackCost };
+        foreach (var observer in recipients)
+        {
+            if (observer.CardId == attacker.CardId || library.FindProgram(observer.Name, other) is null) continue;
+            TriggerTrace?.Add($"{other} → {observer.Name}#{observer.CardId}（eventCard={attacker.Name}#{attacker.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, other, attacker, eventArgs: args, namedArgs: named);
+        }
+    }
+
+    // UpdateFrontlineIfNeeded queries T27 once. i=870 reads current ownership
+    // anew for every callback; earlier callbacks may change it through reentry.
+    internal void ExecuteFrontlineOwnershipChange(CardInstance? instigator, Side oldOwner)
+    {
+        const string trigger = "OnFrontlineOwnershipChange";
+        var recipients = CaptureRegisteredTriggerSnapshot(trigger);
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        int instigatorId = instigator?.CardId ?? 0;
+        foreach (var observer in recipients)
+        {
+            if (library.FindProgram(observer.Name, trigger) is null) continue;
+            Side currentOwner = State.FrontlineOwner;
+            var args = new object?[] { instigatorId, (int)oldOwner, (int)currentOwner };
+            var named = new Dictionary<string, object?> {
+                ["instigator"] = instigatorId, ["instigatorID"] = instigatorId,
+                ["oldSide"] = (int)oldOwner, ["newSide"] = (int)currentOwner,
+            };
+            TriggerTrace?.Add($"{trigger} → {observer.Name}#{observer.CardId}（eventCard={instigator?.Name ?? "null"}#{instigatorId}）");
+            RunTriggerProgram(library, observer, observer.Name, trigger, instigator, eventArgs: args, namedArgs: named);
+        }
+    }
+
+    // T47 and T49 both invoke a saved registered snapshot and exclude only
+    // the subject ID. T49 alone checks stopFurtherActions before each item.
+    internal void ExecuteMovementObservers(string trigger, CardInstance moved,
+        IReadOnlyList<object?> args, IReadOnlyDictionary<string, object?> named,
+        bool stopFurtherActions = false, CardLocation? oldLocation = null, CardLocation? newLocation = null)
+    {
+        var recipients = CaptureRegisteredTriggerSnapshot(trigger);
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        foreach (var observer in recipients)
+        {
+            if (stopFurtherActions && State.StopFurtherActions) break;
+            if (observer.CardId == moved.CardId || library.FindProgram(observer.Name, trigger) is null) continue;
+            TriggerTrace?.Add($"{trigger} → {observer.Name}#{observer.CardId}（eventCard={moved.Name}#{moved.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, trigger, moved, eventArgs: args, namedArgs: named,
+                oldLocation: oldLocation, newLocation: newLocation);
+        }
+    }
+
+    // SetRightLeftMostWhenPlayed runs before the card leaves its own hand.
+    internal void SetHandEdgesWhenPlayed(CardInstance card)
+    {
+        if (card.Location != card.Owner.HandOf()) return;
+        const string left = "WasLeftMostCardWhenPlayedFromHand", right = "WasRightMostWhenPlayedFromHandKey";
+        if (card.LocationNumber == 0) JsonSetBool(card, left, true);
+        else JsonClear(card, left);
+        int greatest = State.CardsUnordered().Where(x => x.Owner == card.Owner && x.Location == card.Owner.HandOf())
+            .Select(x => x.LocationNumber).DefaultIfEmpty(0).Max();
+        if (card.LocationNumber == greatest) JsonSetBool(card, right, true);
+        else JsonClear(card, right);
+    }
+
+    internal void ExecuteOtherCardDrawnEvents(CardInstance drawn, Side side, bool startOfTurnDraw)
+    {
+        const string trigger = "OnOtherCardDrawnFromDeck";
+        // ExecuteOnDrawnFromDeck i=191 queries after the own event. i=460
+        // excludes the drawn ID, and i=708 invokes all other saved recipients.
+        var recipients = CaptureRegisteredTriggerSnapshot(trigger);
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        var args = new object?[] { drawn.CardId, startOfTurnDraw, (int)side };
+        var named = new Dictionary<string, object?>
+        {
+            ["drawnCardID"] = drawn.CardId, ["StartOfTurnDraw"] = startOfTurnDraw, ["drawnSide"] = (int)side,
+        };
+        foreach (var observer in recipients)
+        {
+            if (observer.CardId == drawn.CardId || library.FindProgram(observer.Name, trigger) is null) continue;
+            TriggerTrace?.Add($"{trigger} → {observer.Name}#{observer.CardId}（eventCard={drawn.Name}#{drawn.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, trigger, drawn, eventArgs: args, namedArgs: named);
+        }
+    }
+
+    public void ExecuteCardCreationModifiers(CardInstance created)
+    {
+        // CreateCard i=1036 queries T35 once. i=1309 invokes the saved objects
+        // with no repeated eligibility checks and does not exclude the new ID.
+        const string trigger = "OnOtherCardCreatedAlterCard";
+        var recipients = CaptureRegisteredTriggerSnapshot(trigger);
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        var args = new object?[] { created, 0 };
+        var named = new Dictionary<string, object?> { ["cardPlayed"] = created, ["method"] = 0 };
+        foreach (var observer in recipients)
+        {
+            if (library.FindProgram(observer.Name, trigger) is null) continue;
+            TriggerTrace?.Add($"{trigger} → {observer.Name}#{observer.CardId}（eventCard={created.Name}#{created.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, trigger, created,
+                eventArgs: args, namedArgs: named);
+        }
+    }
+
     private readonly MatchEngine _engine;
 
     public CardApi(MatchEngine engine)
@@ -405,7 +603,10 @@ public sealed partial class CardApi
                             CardLocation? newLocation = null,
                             bool broadcastName = false,
                             IReadOnlyDictionary<string, object?>? localsSeed = null,
-                            IReadOnlyList<CardInstance>? recipientSnapshot = null)
+                            IReadOnlyList<CardInstance>? recipientSnapshot = null,
+                            bool requireRegistration = true,
+                            bool allowSuppressionExceptions = true,
+                            bool includeUnavailableRecipients = false)
     {
         CardInstance? eventCard = eventSubject ?? subject;
         if (_playedCardBroadcastDepth > 0 && programName == "OnOtherCardPlayedFromHand"
@@ -449,20 +650,7 @@ public sealed partial class CardApi
         if (recipientSnapshot is null)
         {
             snapshot.Clear();
-            for (int i = 0; i < 2; i++)
-            {
-                Side s = i == 0 ? Side.Left : Side.Right;
-                snapshot.AddRange(State.Board(s));
-                snapshot.AddRange(State.Discard(s));
-                // Kredit 槽位事件的订阅者包含手牌单位（例如 5th Regiment：
-                // 失槽时在手牌减费），因此该事件必须覆盖手牌；其它事件仍按
-                // 原有棋盘+弃牌堆快照执行。
-                if (programName is "OnAfterExtraKreditSlotGain" or "OnFrontlineOwnershipChange"
-                    or "OnOtherCardMovedToLocationInHand")
-                {
-                    snapshot.AddRange(State.Hand(s));
-                }
-            }
+            snapshot.AddRange(CaptureTriggerSnapshot());
         }
 
         foreach (var card in snapshot)
@@ -473,9 +661,10 @@ public sealed partial class CardApi
             // 而触发派发要的是"这张卡**还在局内**"：指令打出后就躺在弃牌堆里，
             // 但它的"本回合内持续生效"效果还得继续响应事件
             // （`card_event_committed_crew` 就是这类，见上面快照那段注释）。
-            // 只有 `NotAvailable`（被移出对局）才真正不该再收到任何触发。
+            // 通用路径跳过 NotAvailable；直接全局广播可显式保留它，
+            // 例如 GainKreditSlot/LoseKreditSlot 的客户端循环没有位置门。
             // 不在场的卡会不会误触发，由它自己程序里的 `IsLocatedOnBoard` 守卫负责。
-            if (card.Location == CardLocation.NotAvailable)
+            if (!includeUnavailableRecipients && card.Location == CardLocation.NotAvailable)
             {
                 continue;
             }
@@ -483,7 +672,7 @@ public sealed partial class CardApi
             string name = card.Name;
             bool isSubject = ReferenceEquals(card, subject);
 
-            // 蓝图在所有触发点外层都有同一扇 suppression gate：被抑制的
+            // 注册查询通常带抑制例外门；直接循环可关闭例外。被抑制的
             // 接收者默认跳过，只有逐卡白名单里的程序名例外。主体自己的
             // 事件仍由下面的 subject 分支保留，因为已有行为证据明确要求
             // OnSuppressed / OnBecomingVeteran 这类事件继续送达主体。
@@ -513,7 +702,8 @@ public sealed partial class CardApi
             {
                 // 广播：除主体之外的所有卡
                 if (!isSubject
-                    && (!suppressed || HasSuppressionException(card, programName))
+                    && (!requireRegistration || card.Definition.IsRegisteredFor(programName))
+                    && (!suppressed || (allowSuppressionExceptions && HasSuppressionException(card, programName)))
                     && library.FindProgram(name, programName) is not null)
                 {
                     TriggerTrace?.Add($"{programName} → {name}#{card.CardId}" +
@@ -525,7 +715,8 @@ public sealed partial class CardApi
             else if (subject is null || isSubject)
             {
                 // 自己那一路：主体在场就只发主体；主体为 null（全局事件）时发给所有卡
-                if ((!suppressed || isSubject || HasSuppressionException(card, selfProgram))
+                if ((isSubject || !requireRegistration || card.Definition.IsRegisteredFor(selfProgram))
+                    && (!suppressed || isSubject || (allowSuppressionExceptions && HasSuppressionException(card, selfProgram)))
                     && library.FindProgram(name, selfProgram) is not null)
                 {
                     TriggerTrace?.Add($"{selfProgram} → {name}#{card.CardId}" +
@@ -538,7 +729,8 @@ public sealed partial class CardApi
             // 显式的「别的卡」那一路：除主体之外的所有卡
             if (otherProgramName is not null
                 && !isSubject
-                && (!suppressed || HasSuppressionException(card, otherProgramName))
+                && (!requireRegistration || card.Definition.IsRegisteredFor(otherProgramName))
+                && (!suppressed || (allowSuppressionExceptions && HasSuppressionException(card, otherProgramName)))
                 && library.FindProgram(name, otherProgramName) is not null)
             {
                 TriggerTrace?.Add($"{otherProgramName} → {name}#{card.CardId}" +
@@ -556,7 +748,8 @@ public sealed partial class CardApi
                                 && (broadcastName
                                     || programName.StartsWith("OnOther", StringComparison.Ordinal));
         if (!subjectBroadcast
-            && subject is not null && subject.IsAlive && !subject.IsHq && !subject.Location.IsBoard()
+            && subject is not null && subject.Location != CardLocation.NotAvailable
+            && !snapshot.Contains(subject)
             && library.FindProgram(subject.Name, subjectProgram) is not null)
         {
             // ⚠️ 这一支**也必须记 TriggerTrace**。原先漏了它，于是"主体不在棋盘上"
@@ -647,7 +840,9 @@ public sealed partial class CardApi
         CardInstance? eventSubject = null,
         IReadOnlyDictionary<string, object?>? namedArgs = null,
         Func<CardInstance, IReadOnlyDictionary<string, object?>?>? seedFactory = null,
-        IReadOnlyList<CardInstance>? only = null)
+        IReadOnlyList<CardInstance>? only = null,
+        bool recipientsAlreadyFiltered = false,
+        Func<OutParamHit, bool>? stopAfter = null)
     {
         var results = new List<OutParamHit>();
         var library = Blueprint.KismetLibrary.Default;
@@ -656,7 +851,7 @@ public sealed partial class CardApi
             return results;
         }
 
-        // 快照规则与 FireTrigger 一致：棋盘 + 弃牌堆，按嵌套深度分开缓冲。
+        // 与 FireTrigger 一致：全局对象表，包含手牌、牌库和弃牌。
         // ⚠️ 必须先快照：被派发的程序内部会创建/销毁卡（`receiver` 可能被打死）。
         List<CardInstance> snapshot;
         if (only is not null)
@@ -667,25 +862,19 @@ public sealed partial class CardApi
         {
             snapshot = SnapshotBuffer(_triggerDepth);
             snapshot.Clear();
-            for (int i = 0; i < 2; i++)
-            {
-                Side s = i == 0 ? Side.Left : Side.Right;
-                snapshot.AddRange(State.Board(s));
-                snapshot.AddRange(State.Discard(s));
-            }
+            snapshot.AddRange(CaptureTriggerSnapshot());
         }
 
         CardInstance? eventCard = eventSubject ?? subject;
         foreach (var card in snapshot)
         {
-            if (card.Location == CardLocation.NotAvailable)
+            // A Blueprint query returns a fixed object array. Preserve its
+            // eligibility even if earlier callbacks change suppression/location.
+            if (!recipientsAlreadyFiltered)
             {
-                continue;
-            }
-
-            if (SuppressedSkipsTrigger(card, programName))
-            {
-                continue;
+                if (card.Location == CardLocation.NotAvailable
+                    || SuppressedSkipsTrigger(card, programName)
+                    || !card.Definition.IsRegisteredFor(programName)) continue;
             }
 
             var program = library.FindProgram(card.Name, programName);
@@ -720,8 +909,10 @@ public sealed partial class CardApi
             try
             {
                 var perCardSeed = seedFactory?.Invoke(card) ?? seed;
-                results.Add(new OutParamHit(card,
-                    Vm.RunLocalProgramMulti(program, ctx, perCardSeed, outParamNames)));
+                var hit = new OutParamHit(card,
+                    Vm.RunLocalProgramMulti(program, ctx, perCardSeed, outParamNames));
+                results.Add(hit);
+                if (stopAfter?.Invoke(hit) == true) break;
             }
             finally
             {
@@ -744,7 +935,8 @@ public sealed partial class CardApi
         string functionName, CardInstance? subject, string[] outParamNames,
         IReadOnlyDictionary<string, object?>? seed = null,
         IReadOnlyList<CardInstance>? only = null,
-        bool includeSubject = false)
+        bool includeSubject = false,
+        bool recipientsAlreadyFiltered = false)
     {
         var results = new List<OutParamHit>();
         var library = Blueprint.KismetLibrary.Default;
@@ -762,25 +954,16 @@ public sealed partial class CardApi
         {
             snapshot = SnapshotBuffer(_triggerDepth);
             snapshot.Clear();
-            foreach (Side side in new[] { Side.Left, Side.Right })
-            {
-                snapshot.AddRange(State.Board(side));
-                snapshot.AddRange(State.Discard(side));
-            }
+            snapshot.AddRange(CaptureTriggerSnapshot());
         }
 
         foreach (var card in snapshot)
         {
-            if (card.Location == CardLocation.NotAvailable
-                || (!includeSubject && ReferenceEquals(card, subject)))
-            {
-                continue;
-            }
-
-            if (SuppressedSkipsTrigger(card, functionName))
-            {
-                continue;
-            }
+            if (!includeSubject && ReferenceEquals(card, subject)) continue;
+            if (!recipientsAlreadyFiltered
+                && (card.Location == CardLocation.NotAvailable
+                    || SuppressedSkipsTrigger(card, functionName)
+                    || !card.Definition.IsRegisteredFor(functionName))) continue;
 
             var program = library.FindLocalProgram(card.Definition.Name, functionName);
             if (program is null)
@@ -832,7 +1015,7 @@ public sealed partial class CardApi
     /// si=3676  FetchAllCardsWithEventTrigger(14)          ; 14 = OnBeforeOtherCardDeploymentTrigger
     /// si=4081  PopExecutionFlowIfNot(cancelDeploymentEffect)   ; 假 ⇒ 继续循环
     /// si=4197  Temp_bool_True_if_break_was_hit_Variable = true ; 真 ⇒ 跳出
-    /// si=4283  JumpIfNot 5702 if !cancelDeploymentEffect
+    /// si=4283  JumpIfNot 5782 if !cancelDeploymentEffect (current pak)
     /// si=4297  （取消分支）OnPlayedFromHandExecuted = false
     /// si=4308  NotifySideEffectTrigger(side, 'sideeffect.blockdeployment')
     /// si=4881  Jump 6853                                    ; ★ 取消分支到此返回，
@@ -868,13 +1051,16 @@ public sealed partial class CardApi
             ["instigatorID"] = sourceId,
         };
 
-        var outs = BroadcastWithOutParam(
-            "OnBeforeOtherCardDeploymentTrigger", card, card.Owner, "cancelDeploymentEffect",
-            seed: seed, eventArgs: new object?[] { card, sourceId }, eventSubject: card, namedArgs: named);
+        var outs = BroadcastWithOutParams(
+            "OnBeforeOtherCardDeploymentTrigger", card, card.Owner, new[] { "cancelDeploymentEffect" },
+            seed: seed, eventArgs: new object?[] { card, sourceId }, eventSubject: card, namedArgs: named,
+            only: CaptureRegisteredTriggerSnapshot("OnBeforeOtherCardDeploymentTrigger"),
+            recipientsAlreadyFiltered: true,
+            stopAfter: hit => Blueprint.KismetVm.Truthy(hit.Outs.GetValueOrDefault("cancelDeploymentEffect")));
 
-        foreach (var v in outs)
+        foreach (var hit in outs)
         {
-            if (Blueprint.KismetVm.Truthy(v))
+            if (Blueprint.KismetVm.Truthy(hit.Outs.GetValueOrDefault("cancelDeploymentEffect")))
             {
                 return true;
             }
@@ -916,15 +1102,16 @@ public sealed partial class CardApi
             ["instigatorID"] = sourceId,
         };
 
-        var outs = BroadcastWithOutParam(
-            "OnDeploymentEffectTriggered", card, card.Owner, "TriggerMultiple",
+        var outs = BroadcastWithOutParams(
+            "OnDeploymentEffectTriggered", card, card.Owner, new[] { "TriggerMultiple" },
             seed: seed, eventArgs: new object?[] { card, sourceId }, eventSubject: card,
-            namedArgs: named);
+            namedArgs: named, only: CaptureRegisteredTriggerSnapshot("OnDeploymentEffectTriggered"),
+            recipientsAlreadyFiltered: true);
 
         int total = 0;
-        foreach (var v in outs)
+        foreach (var hit in outs)
         {
-            total += AsInt(v);
+            total += AsInt(hit.Outs.GetValueOrDefault("TriggerMultiple"));
         }
 
         return total;
@@ -985,10 +1172,12 @@ public sealed partial class CardApi
     /// <param name="card">触发摧毁效果的那张卡（`cardTriggered`）。</param>
     /// <param name="instigator">摧毁者（`instigatorID` 的来源）。</param>
     /// <returns>订阅者累加出来的 TriggerMultiple —— 调用方要再整轮派发这么多次。</returns>
-    public int FireDestructionEffectTriggered(CardInstance card, CardInstance? instigator)
+    public int FireDestructionEffectTriggered(CardInstance card, CardInstance? instigator,
+        IReadOnlyList<int>? batch = null, IReadOnlyList<CardInstance>? recipients = null,
+        bool skipSuppressCheck = false)
     {
         // si=325/710：skipSuppressCheck=false 且 cardTriggered 被压制 ⇒ 整轮不派发。
-        if (card.Keywords.Contains(Keyword.Suppressed))
+        if (!skipSuppressCheck && card.IsSuppressed)
         {
             return 0;
         }
@@ -999,8 +1188,8 @@ public sealed partial class CardApi
             ["instigatorID"] = instigator?.CardId ?? 0,
         };
 
-        var outs = BroadcastWithOutParam(
-            "OnDestructionEffectTriggered", card, card.Owner, "TriggerMultiple",
+        var outs = BroadcastWithOutParams(
+            "OnDestructionEffectTriggered", card, card.Owner, new[] { "TriggerMultiple" },
             eventArgs: new object?[] { card, instigator?.CardId ?? 0, false },
             eventSubject: card,
             namedArgs: named,
@@ -1010,13 +1199,14 @@ public sealed partial class CardApi
                 ["instigatorID"] = instigator?.CardId ?? 0,
                 // si=398：CardsToDestroy 就是「被摧毁的那一张」，所以这个 bool 等价于
                 // 「订阅卡自己也在被摧毁的那批里」。
-                ["SelfAlsoDestroyed"] = observer.CardId == card.CardId,
-            });
+                ["SelfAlsoDestroyed"] = batch?.Contains(observer.CardId) ?? observer.CardId == card.CardId,
+            }, only: recipients ?? CaptureRegisteredTriggerSnapshot("OnDestructionEffectTriggered"),
+            recipientsAlreadyFiltered: true);
 
         int total = 0;
-        foreach (var v in outs)
+        foreach (var hit in outs)
         {
-            total += AsInt(v);
+            total += AsInt(hit.Outs.GetValueOrDefault("TriggerMultiple"));
         }
 
         return total;
@@ -1038,8 +1228,8 @@ public sealed partial class CardApi
     /// 读的是同一份存储（<see cref="CustomNameHasAttribute"/>），所以两边不会漂。
     /// </summary>
     public bool ShouldTriggerDestructionEffect(CardInstance card)
-        => !CustomNameHasAttribute(card, "customName1", "StopDestructionEffect")
-           && (card.Keywords.Contains(Keyword.Destruction) || HasCustomAbility(card, "destruction"));
+        => (!CustomNameHasAttribute(card, "customName1", "StopDestructionEffect")
+            && card.Keywords.Contains(Keyword.Destruction)) || HasCustomAbility(card, "destruction");
 
     /// <summary>
     /// `TriggerDestruction(card, instigatorID, StealSide, RemoveDestruction, out qqq)`。
@@ -1051,62 +1241,92 @@ public sealed partial class CardApi
     public int TriggerDestruction(CardInstance card, CardInstance? instigator,
         bool stealSide, bool removeDestruction)
     {
-        if (!card.IsAlive || !ShouldTriggerDestructionEffect(card))
-        {
-            return 0;
-        }
-
+        // UObject validity is distinct from IsAlive: discarded cards are valid targets.
+        Side originalSide = card.Owner;
         if (stealSide)
         {
             JsonSetInt(card, "destructionTriggerStolenOnTurn", GetTurnNumber());
         }
 
-        // 蓝图的 StealSide 分支通过 ConstructAndCopyCard 生成一个不加入牌局的
-        // 临时对象，再把它的阵营反转。保留原 cardID 很重要：事件 24 用原卡 ID
-        // 构造 CardsToDestroy，订阅者据此判断 SelfAlsoDestroyed。
-        CardInstance triggerCard = stealSide ? CopyForStealSide(card) : card;
-
-        _engine.FireSubAction("ZActionTriggerDestruction", new[]
-        {
-            ActionValue2.Bool("RemoveDestruction", removeDestruction),
-            ActionValue2.Bool("StealSide", stealSide),
-            ActionValue2.Int("instigatorID", instigator?.CardId ?? 0),
-        });
-
+        // i=276 captures T24 before the before-destroy hooks can change subscribers.
+        var recipients = CaptureTriggerSnapshot()
+            .Where(x => x.Definition.IsRegisteredFor("OnDestructionEffectTriggered")).ToArray();
+        if (ShouldTriggerDestructionEffect(card))
+            _engine.BeforeDestroyed(card, instigator, false, triggered: true);
         var destroyedArgs = new object?[] { null, true };
         var destroyedNamed = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             ["killer"] = null,
             ["TriggerNotDestroyed"] = true,
-            ["destroyedLocation"] = (int)card.Location,
         };
-        if (stealSide && Blueprint.KismetLibrary.Default is { } library)
+        if (!CustomNameHasAttribute(card, "customName1", "StopDestructionEffect")
+            && card.Keywords.Contains(Keyword.Destruction))
         {
-            // ConstructAndCopyCard 的对象不在 GameState 快照中，不能经由 FireTrigger
-            // 的“主体不在棋盘”兜底派发；直接跑它自己的入口等价于 OnDestroyed。
-            RunTriggerProgram(library, triggerCard, triggerCard.Name, "OnDestroyed", triggerCard,
-                destroyedArgs, namedArgs: destroyedNamed);
-        }
-        else
-        {
-            FireTrigger("OnDestroyed", triggerCard, triggerCard.Owner,
-                eventArgs: destroyedArgs,
-                eventSubject: triggerCard,
-                namedArgs: destroyedNamed);
-        }
-
-        int triggerMultiple = FireDestructionEffectTriggered(triggerCard, instigator);
-        for (int i = 0; i < triggerMultiple; i++)
-        {
-            FireDestructionEffectTriggered(triggerCard, instigator);
-        }
-
-        if (removeDestruction && HasCustomAbility(card, "destruction"))
-        {
-            card.CustomAbility = null;
+            CardInstance triggerCard = stealSide ? CopyForStealSide(card) : card;
+            void SelfEffect()
+            {
+                if (Blueprint.KismetLibrary.Default is { } library)
+                    RunTriggerProgram(library, triggerCard, triggerCard.Name, "OnDestroyed", triggerCard,
+                        destroyedArgs, namedArgs: destroyedNamed);
+            }
+            SelfEffect();
+            // i=1275/1504 SetArray has no values: no subscriber is being destroyed.
+            int extra = FireDestructionEffectTriggered(triggerCard, instigator, Array.Empty<int>(), recipients);
+            for (int i = 0; i < extra; i++)
+            {
+                SelfEffect();
+                FireDestructionEffectTriggered(triggerCard, instigator, Array.Empty<int>(), recipients);
+            }
         }
 
-        return triggerMultiple;
+        if (card.ReceivedAbilitiesFromCards.TryGetValue("destruction", out var givers))
+        {
+            // i=1771..3203 temporarily changes the actual target side for source effects.
+            var sources = givers.ToArray();
+            State.ChangeOwner(card, stealSide ? originalSide.Opposite() : originalSide, normalize: false);
+            try
+            {
+                foreach (int sourceId in sources)
+                {
+                    if (sourceId == card.CardId || State.ById(sourceId) is not { } source) continue;
+                    void SourceEffect() => FireTrigger("OnOtherCardDestroyed", source, source.Owner,
+                        selfProgramName: "OnOtherCardDestroyed", eventSubject: card,
+                        eventArgs: new object?[] { card, null, true, 0, false, false },
+                        namedArgs: new Dictionary<string, object?>
+                        {
+                            ["cardDestroyed"] = card, ["killer"] = null, ["TriggerNotDestroyed"] = true,
+                            ["destroyedLocation"] = 0, ["selfIsAlsoGettingDestroyed"] = false,
+                            ["destroyedInCombat"] = false,
+                        });
+                    SourceEffect();
+                    int extra = FireDestructionEffectTriggered(card, instigator, new[] { 0 }, recipients);
+                    for (int i = 0; i < extra; i++)
+                    {
+                        SourceEffect();
+                        FireDestructionEffectTriggered(card, instigator, new[] { 0 }, recipients);
+                    }
+                }
+            }
+            finally { State.ChangeOwner(card, originalSide, normalize: false); }
+        }
+        _engine.FireSubAction("ZActionTriggerDestruction", new[]
+        {
+            ActionValue2.Int("cardID", card.CardId),
+            ActionValue2.Int("instigatorID", instigator?.CardId ?? 0),
+            ActionValue2.Bool("StealSide", stealSide),
+            ActionValue2.Bool("RemoveDestruction", removeDestruction),
+        });
+        if (removeDestruction)
+        {
+            if (HasCustomAbility(card, "destruction")) CustomAbilityRemove(card, "destruction", 0, true);
+            if (IsLocatedOnBoard(card))
+            {
+                SuffixAdd(new EffectContext { Engine = _engine, State = State, Self = card, Controller = card.Owner },
+                    card, new object?[] { "StopDestructionEffect" }, "customName1");
+                PersistCustomFields(card);
+            }
+        }
+        return 0; // qqq is never assigned on the valid path in the Blueprint.
     }
 
     private static CardInstance CopyForStealSide(CardInstance source)
@@ -1116,6 +1336,8 @@ public sealed partial class CardApi
             CardId = source.CardId,
             Name = source.Name,
             Owner = source.Owner.Opposite(),
+            OriginalOwner = source.OriginalOwner,
+            UnderEnemyControl = source.UnderEnemyControl,
             Definition = source.Definition,
             IsGold = source.IsGold,
             Location = source.Location,
@@ -1123,10 +1345,16 @@ public sealed partial class CardApi
             Attack = source.Attack,
             Defense = source.Defense,
             MaxDefense = source.MaxDefense,
+            RangeOverride = source.RangeOverride,
+            ExileNation = source.ExileNation,
             KreditCost = source.KreditCost,
             OperationCost = source.OperationCost,
+            VeteranOperationCost = source.VeteranOperationCost,
+            VeteranHeavyArmor = source.VeteranHeavyArmor,
+            EffectType = source.EffectType,
             EnteredPlayOnTurn = source.EnteredPlayOnTurn,
             OperationsUsedThisTurn = source.OperationsUsedThisTurn,
+            HasEverAttacked = source.HasEverAttacked,
             HasAttackedThisTurn = source.HasAttackedThisTurn,
             GotchaActivated = source.GotchaActivated,
             CardSeen = source.CardSeen,
@@ -1136,8 +1364,10 @@ public sealed partial class CardApi
             SalvagedCardId = source.SalvagedCardId,
             Cipher = source.Cipher,
             AttacksThisTurn = source.AttacksThisTurn,
+            AttackQuotaOffset = source.AttackQuotaOffset,
             HasBeenAttackedThisTurn = source.HasBeenAttackedThisTurn,
             ChooseOne = source.ChooseOne,
+            SelectTargetOnPlayedFromHand = source.SelectTargetOnPlayedFromHand,
             HasMovedThisTurn = source.HasMovedThisTurn,
             SuppressedOnTurn = source.SuppressedOnTurn,
             HeavyArmorZeroedBySuppress = source.HeavyArmorZeroedBySuppress,
@@ -1167,10 +1397,16 @@ public sealed partial class CardApi
                     x.Key, x.Value.Clone()))
                 .ToList();
 
-        foreach (var (key, value) in source.CustomJson)
-        {
-            copy.CustomJson[key] = value;
-        }
+        copy.CustomJson.CopyFrom(source.CustomJson);
+        // Native CopyData (+0x108) copies the object-owned outgoing ID array.
+        copy.CardsBuffedByThisCard.AddRange(source.CardsBuffedByThisCard);
+
+        copy.ReceivedAbilitiesFromCards.Clear();
+        foreach (var (ability, givers) in source.ReceivedAbilitiesFromCards)
+            copy.ReceivedAbilitiesFromCards[ability] = new List<int>(givers);
+        copy.SuppressStrippedAbilities = source.SuppressStrippedAbilities?.ToDictionary(
+            kv => kv.Key, kv => new List<int>(kv.Value), StringComparer.Ordinal);
+        copy.RemovedGameplayTags.UnionWith(source.RemovedGameplayTags);
 
         foreach (var (key, value) in source.BuffsBySource)
         {
@@ -1184,13 +1420,11 @@ public sealed partial class CardApi
     /// `CustomName{1,2}HasAttribute(标记)` 的**静态读法**（引擎内部用，不走派发表）。
     ///
     /// 存储键与派发表里的 <c>SuffixAdd</c>/<c>SuffixHas</c> 完全一致
-    /// （<c>customName1</c> / <c>customName2</c>，值是用逗号分隔的标记串）——
+    /// （<c>customName1</c> / <c>customName2</c>，值是用分号分隔的标记串）——
     /// 两处**必须**共用同一个读法，否则「谁写了、谁没看见」这种漂移没人能查。
     /// </summary>
     public static bool CustomNameHasAttribute(CardInstance card, string set, string attribute)
-        => card.CustomJson.TryGetValue(set, out string? v)
-           && v.Split(',', StringSplitOptions.RemoveEmptyEntries)
-               .Contains(attribute, StringComparer.Ordinal);
+        => CardCustomNames.Has(card, set, attribute);
 
     /// <summary>诊断用：非 null 时记录每一次实际派发（`事件名 → 卡名#ID`）。</summary>
     public List<string>? TriggerTrace { get; set; }
@@ -1217,7 +1451,7 @@ public sealed partial class CardApi
     /// 命中就合成 ubergraph 的分派前导 —— 对带出参的普通函数是错的
     /// （它们根本不在 ubergraph 里，见 P1 §1）。
     ///
-    /// 返回 null = **这张卡没有这个函数**（全卡池 1735 张里只有 33 张有
+    /// 返回 null = **这张卡没有这个函数**（全卡池 2019 张里只有 33 张有
     /// `OnCardDealDamage_ModifyDamageDealt`）。调用方必须把 null 当「默认体」处理，
     /// 不能拿一个猜的默认值顶替。
     /// </summary>
@@ -1260,6 +1494,14 @@ public sealed partial class CardApi
         {
             _triggerDepth--;
         }
+    }
+
+    public bool IsBlockedFromPlay(CardInstance card, out string reason)
+    {
+        var result = RunOwnLocal(card, "BlockCardFromBeingPlayedFromHand", null,
+            "blocked", "reason", "reasonParam1", "reasonParam2");
+        reason = result?.GetValueOrDefault("reason")?.ToString() ?? "";
+        return result is not null && KismetVmTruthy(result.GetValueOrDefault("blocked"));
     }
 
     private CardInstance? FindOnBoard(string cardName, CardInstance? prefer)
@@ -1459,64 +1701,32 @@ public sealed partial class CardApi
             {
                 calculated = AsInt(outs.GetValueOrDefault("newDamage"));
             }
-            // outs == null ⇒ 这张卡没有这个函数（全卡池 1735 张里只有 33 张有），
+            // outs == null ⇒ 这张卡没有这个函数（全卡池 2019 张里只有 33 张有），
             // 蓝图里 `BlueprintNativeEvent` 的默认体就是「不修改伤害」。
         }
 
-        // si=109：事件 37 的订阅者。**含主体自己**（这一段没有 `NotEqual(item, dealer)`）。
-        var first = BroadcastWithOutParams(
-            "OnOtherCardDealDamageAddDamage", dealer, receiver.Owner, new[] { "damageToAdd", "reRunAtEnd" },
-            eventArgs: new object?[] { dealer, receiver, calculated, fromAttack, isDefenderDamage },
-            eventSubject: dealer,
-            namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-            {
-                ["cardDealingDamage"] = dealer,
-                ["toCard"] = receiver,
-                ["damage"] = calculated,
-                ["fromAttack"] = fromAttack,
-                ["isDefenderDamage"] = isDefenderDamage,
-            },
-            seedFactory: _ => new Dictionary<string, object?>(StringComparer.Ordinal)
-            {
-                ["cardDealingDamage"] = dealer,
-                ["toCard"] = receiver,
-                ["damage"] = calculated,
-                ["fromAttack"] = fromAttack,
-                ["isDefenderDamage"] = isDefenderDamage,
-            });
-
+        // Each observer receives the damage left by its predecessor (i=109/481).
+        var recipients = CaptureRegisteredTriggerSnapshot("OnOtherCardDealDamageAddDamage");
         var reRun = new List<CardInstance>();
-        foreach (var (card, outs) in first)
+        void Visit(CardInstance observer, bool collectRerun)
         {
-            calculated += AsInt(outs.GetValueOrDefault("damageToAdd"));
-            if (Blueprint.KismetVm.Truthy(outs.GetValueOrDefault("reRunAtEnd")))
+            var args = new Dictionary<string, object?>
             {
-                // si=623：记的是**卡**（`Array_Add(addDamageToReRun, item)`），不是值。
-                reRun.Add(card);
-            }
+                ["cardDealingDamage"] = dealer, ["toCard"] = receiver,
+                ["damage"] = calculated, ["fromAttack"] = fromAttack,
+                ["isDefenderDamage"] = isDefenderDamage,
+            };
+            var hits = BroadcastWithOutParams("OnOtherCardDealDamageAddDamage", dealer,
+                receiver.Owner, new[] { "damageToAdd", "reRunAtEnd" },
+                seed: args, namedArgs: args, only: new[] { observer }, recipientsAlreadyFiltered: true);
+            if (hits.Count == 0) return;
+            var hit = hits[0];
+            calculated += AsInt(hit.Outs.GetValueOrDefault("damageToAdd"));
+            if (collectRerun && Blueprint.KismetVm.Truthy(hit.Outs.GetValueOrDefault("reRunAtEnd")))
+                reRun.Add(observer);
         }
-
-        // si=805..1295：对 reRunAtEnd 的那批再整轮派发一次（第二次不再看 reRunAtEnd）。
-        if (reRun.Count > 0)
-        {
-            var second = BroadcastWithOutParams(
-                "OnOtherCardDealDamageAddDamage", dealer, receiver.Owner, new[] { "damageToAdd", "reRunAtEnd" },
-                eventArgs: new object?[] { dealer, receiver, calculated, fromAttack, isDefenderDamage },
-                eventSubject: dealer,
-                namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-                {
-                    ["cardDealingDamage"] = dealer,
-                    ["toCard"] = receiver,
-                    ["damage"] = calculated,
-                    ["fromAttack"] = fromAttack,
-                    ["isDefenderDamage"] = isDefenderDamage,
-                },
-                only: reRun);
-            foreach (var (_, outs) in second)
-            {
-                calculated += AsInt(outs.GetValueOrDefault("damageToAdd"));
-            }
-        }
+        foreach (var observer in recipients) Visit(observer, true);
+        foreach (var observer in reRun) Visit(observer, false);
 
         // si=1300：Clamp(.., 0, 99)
         calculated = Math.Clamp(calculated, 0, 99);
@@ -1557,10 +1767,12 @@ public sealed partial class CardApi
             ["toCard"] = receiver,
             ["damageAmount"] = damage,
             ["damage"] = damage,
+            ["Damage"] = damage,
             ["tmpDamage"] = damage,
             ["isCombatDamage"] = isCombatDamage,
             ["isAttackingDamage"] = isAttackingDamage,
             ["fromAttack"] = isCombatDamage,
+            ["isAttacker"] = isAttackingDamage,
             ["isRedirected"] = isRedirected,
         };
 
@@ -1576,21 +1788,8 @@ public sealed partial class CardApi
 
         // National Fire Service is deliberately deferred by the Blueprint so a
         // gotcha response observes the already-adjusted damage.
-        var snapshot = new List<CardInstance>();
-        foreach (Side side in new[] { Side.Left, Side.Right })
-        {
-            snapshot.AddRange(State.Board(side));
-            snapshot.AddRange(State.Discard(side));
-        }
-
-        var firstPass = snapshot
-            .Where(card => !string.Equals(card.Name, "card_event_national_fire_service",
-                StringComparison.Ordinal))
-            .ToList();
-        var delayed = snapshot
-            .Where(card => string.Equals(card.Name, "card_event_national_fire_service",
-                StringComparison.Ordinal))
-            .ToList();
+        var snapshot = CaptureRegisteredTriggerSnapshot("OnOtherCardDealDamageAddDamageAfterCalc");
+        var delayed = new List<CardInstance>();
 
         IReadOnlyDictionary<string, object?> SeedFor(int amount)
         {
@@ -1598,16 +1797,25 @@ public sealed partial class CardApi
             {
                 ["damageAmount"] = amount,
                 ["damage"] = amount,
+                ["Damage"] = amount,
                 ["tmpDamage"] = amount,
             };
             return copy;
         }
 
-        foreach (var hit in BroadcastLocalWithOutParams(
-                     "OnOtherCardDealDamageAddDamageAfterCalc", dealer,
-                     new[] { "damageToAdd", "stopAdding" },
-                     SeedFor(finalDamage), firstPass))
+        foreach (var observer in snapshot)
         {
+            // i=595/673: collect only cards reached before stopAdding ends this loop.
+            if (string.Equals(observer.Name, "card_event_national_fire_service", StringComparison.Ordinal))
+            {
+                delayed.Add(observer);
+                continue;
+            }
+            var hits = BroadcastLocalWithOutParams(
+                "OnOtherCardDealDamageAddDamageAfterCalc", dealer,
+                new[] { "damageToAdd", "stopAdding" }, SeedFor(finalDamage), new[] { observer }, recipientsAlreadyFiltered: true);
+            if (hits.Count == 0) continue;
+            var hit = hits[0];
             finalDamage = Math.Max(finalDamage + AsInt(hit.Outs.GetValueOrDefault("damageToAdd")), 0);
             if (Blueprint.KismetVm.Truthy(hit.Outs.GetValueOrDefault("stopAdding")))
             {
@@ -1615,16 +1823,14 @@ public sealed partial class CardApi
             }
         }
 
-        foreach (var hit in BroadcastLocalWithOutParams(
-                     "OnOtherCardDealDamageAddDamageAfterCalc", dealer,
-                     new[] { "damageToAdd", "stopAdding" },
-                     SeedFor(finalDamage), delayed))
+        foreach (var observer in delayed)
         {
+            var hits = BroadcastLocalWithOutParams(
+                "OnOtherCardDealDamageAddDamageAfterCalc", dealer,
+                new[] { "damageToAdd", "stopAdding" }, SeedFor(finalDamage), new[] { observer }, includeSubject: true, recipientsAlreadyFiltered: true);
+            if (hits.Count == 0) continue;
+            var hit = hits[0];
             finalDamage = Math.Max(finalDamage + AsInt(hit.Outs.GetValueOrDefault("damageToAdd")), 0);
-            if (Blueprint.KismetVm.Truthy(hit.Outs.GetValueOrDefault("stopAdding")))
-            {
-                break;
-            }
         }
 
         return finalDamage;
@@ -1680,61 +1886,80 @@ public sealed partial class CardApi
         ApplyCalculatedDamage(target, amount, source, isCombatDamage, counterDamage, isRedirected);
     }
 
-    /// <summary>
-    /// Resolve an ordinary unit attack as simultaneous combat: calculate both
-    /// damage directions, apply both defenses, then dispatch damage events.
-    /// Destruction is left to the attack owner after the combat-survival hooks.
-    /// </summary>
+    /// <summary>AttackCard calculates both directions, then ExecuteAttackCard resolves them in phases.</summary>
     internal (int ToDefender, int ToAttacker) DealCombatDamagePair(
-        CardInstance attacker, CardInstance defender, int damageToDefender, int damageToAttacker,
-        Action<int, int> afterBothApplied)
+        CardInstance attacker, CardInstance defender, Action<int, int> afterBothApplied)
     {
-        int oldDefenderDefense = defender.Defense;
-        int oldAttackerDefense = attacker.Defense;
-        int finalToDefender = CalculateCombatDamage(
-            attacker, defender, damageToDefender, counterDamage: false);
-        int finalToAttacker = CalculateCombatDamage(
-            defender, attacker, damageToAttacker, counterDamage: true);
-
-        int appliedToDefender = _engine.ApplyDamage(defender, finalToDefender, attacker,
-            isCombatDamage: true, damageAlreadyCalculated: true);
-        int appliedToAttacker = _engine.ApplyDamage(attacker, finalToAttacker, defender,
-            isCombatDamage: true, damageAlreadyCalculated: true);
-
-        afterBothApplied(appliedToDefender, appliedToAttacker);
-
-        if (damageToDefender > 0)
+        int toDefender = CalculateCombatDamage(attacker, defender, true);
+        int toAttacker = CalculateCombatDamage(defender, attacker, false);
+        toDefender = ExecuteOnDealDamageAddDamageAfterCalc(attacker, defender, toDefender, true, true, false);
+        toAttacker = ExecuteOnDealDamageAddDamageAfterCalc(defender, attacker, toAttacker, true, false, false);
+        _engine.SetAttackerHasAttacked(attacker); // ExecuteAttackCard i=279.
+        defender.HasBeenAttackedThisTurn = true;
+        // i=335..617: attacks against Locations preserve Shock.
+        if (!IsLocationCard(defender) && attacker.Keywords.Contains(Keyword.Shock) && !HasCustomAbility(attacker, "CantLoseShock"))
+            RemoveKeyword(attacker, Keyword.Shock);
+        if (toDefender > 0 && !defender.IsSuppressed) ExecuteBeforeReceiveDamage(defender, attacker, toDefender, true);
+        if (toAttacker > 0 && !attacker.IsSuppressed) ExecuteBeforeReceiveDamage(attacker, defender, toAttacker, true);
+        int excess = 0;
+        if (HasCustomAbility(attacker, "excess") && IsUnit(defender) && toDefender > defender.Defense)
         {
-            ApplyCalculatedDamage(defender, finalToDefender, attacker,
-                isCombatDamage: true, counterDamage: false, isRedirected: false,
-                appliedDamage: appliedToDefender, deferDestruction: true,
-                oldDefense: oldDefenderDefense);
+            excess = toDefender - defender.Defense;
+            toDefender = defender.Defense;
         }
-
-        if (damageToAttacker > 0)
+        _engine.ApplyDamage(defender, toDefender, attacker, isCombatDamage: true, damageAlreadyCalculated: true);
+        bool defenderDestroyed = defender.Defense <= 0
+            || toDefender > 0 && HasCustomAbility(attacker, "lethal") && !IsLocationCard(defender);
+        _engine.ApplyDamage(attacker, toAttacker, defender, isCombatDamage: true, damageAlreadyCalculated: true);
+        bool attackerDestroyed = attacker.Defense <= 0
+            || toAttacker > 0 && HasCustomAbility(defender, "lethal");
+        // i=2745 notify, i=3021 excess, i=3201/3249 survivors, then deal effects.
+        afterBothApplied(toDefender, toAttacker);
+        if (excess > 0) DealDamage(State.Hq(defender.Owner), excess, attacker);
+        if (IsUnit(defender))
         {
-            ApplyCalculatedDamage(attacker, finalToAttacker, defender,
-                isCombatDamage: true, counterDamage: true, isRedirected: false,
-                appliedDamage: appliedToAttacker, deferDestruction: true,
-                oldDefense: oldAttackerDefense);
+            if (!attackerDestroyed) FireSurvivedCombat(attacker, defender);
+            if (!defenderDestroyed) FireSurvivedCombat(defender, attacker);
         }
-
-        return (appliedToDefender, appliedToAttacker);
+        if (toDefender > 0) ExecuteOnCardDealDamageEffects(defender, attacker, toDefender, true, false, false);
+        if (toAttacker > 0) ExecuteOnCardDealDamageEffects(attacker, defender, toAttacker, true, true, false);
+        if (defenderDestroyed && defender.IsHq)
+        {
+            State.Finish(defender.Owner.Opposite(), "Victory_DestroyHQ");
+            return (toDefender, toAttacker);
+        }
+        if (!defenderDestroyed && toDefender > 0 && defender.Keywords.Contains(Keyword.Mobilize)) RemoveMobilize(defender);
+        if (attackerDestroyed && defenderDestroyed) _engine.DestroyCombatPair(defender, attacker);
+        else if (attackerDestroyed) _engine.Destroy(attacker, defender, destroyedInCombat: true);
+        else if (defenderDestroyed) _engine.Destroy(defender, attacker, destroyedInCombat: true);
+        if (!attackerDestroyed && toAttacker > 0 && attacker.Keywords.Contains(Keyword.Mobilize)) RemoveMobilize(attacker);
+        return (toDefender, toAttacker);
     }
 
-    private int CalculateCombatDamage(CardInstance dealer, CardInstance receiver,
-                                      int amount, bool counterDamage)
+    /// <summary>CalculateDamageDealt with the four flags passed by ordinary AttackCard.</summary>
+    private int CalculateCombatDamage(CardInstance dealer, CardInstance receiver, bool isAttacker)
     {
-        if (amount <= 0 || !receiver.IsAlive)
+        if (receiver.Keywords.Contains(Keyword.Immune)) return 0;
+        int damage = ExecuteOnDealDamageAddDamage(dealer, receiver, dealer.Attack, true, false, !isAttacker);
+        int reverseDamage = ExecuteOnDealDamageAddDamage(receiver, dealer, receiver.Attack, true, false, isAttacker);
+        // i=823..2019: Ambush predicts the first hit with both defenses intact.
+        // The native default returns zero; two card Blueprints override the function.
+        if (receiver.Keywords.Contains(Keyword.Ambush) && isAttacker
+            && !receiver.HasBeenAttackedThisTurn && !dealer.Keywords.Contains(Keyword.Immune)
+            && !IsArtillery(dealer)
+            && (!MatchEngine.IsBomber(dealer) || receiver.Definition.Type == "fighter" || IsAntiAir(receiver))
+            && !dealer.Keywords.Contains(Keyword.Shock) && !MatchEngine.IsBomber(receiver))
         {
-            return 0;
+            var passive = RunOwnLocal(dealer, "GetPassiveDefenseBuff",
+                new Dictionary<string, object?> { ["incomingDamage"] = reverseDamage }, "amount");
+            if (reverseDamage >= dealer.Defense + dealer.HeavyArmor + AsInt(passive?.GetValueOrDefault("amount")))
+                damage = 0;
         }
-
-        amount = ExecuteOnDealDamageAddDamage(dealer, receiver, amount,
-            fromAttack: true, fromFight: false, isDefenderDamage: counterDamage);
-        amount = ExecuteOnDealDamageAddDamageAfterCalc(dealer, receiver, amount,
-            isCombatDamage: true, isAttackingDamage: !counterDamage, isRedirected: false);
-        return _engine.CalculateAppliedDamage(receiver, amount, dealer, isCombatDamage: true);
+        // i=2043..2853: artillery, bomber, anti-air and Shock retaliation gates.
+        if (!isAttacker && (IsArtillery(receiver) || MatchEngine.IsBomber(dealer)
+            || MatchEngine.IsBomber(receiver) && dealer.Definition.Type != "fighter" && !IsAntiAir(dealer)
+            || IsUnit(dealer) && receiver.Keywords.Contains(Keyword.Shock))) damage = 0;
+        return damage > 0 ? Math.Max(damage - receiver.HeavyArmor, 0) : damage;
     }
 
     /// <summary>
@@ -1778,8 +2003,21 @@ public sealed partial class CardApi
     internal void ApplyCalculatedDamage(CardInstance target, int amount, CardInstance? source,
                                         bool isCombatDamage, bool counterDamage, bool isRedirected,
                                         int? appliedDamage = null, bool deferDestruction = false,
-                                        int? oldDefense = null)
+                                        int? oldDefense = null, bool beforeReceiveExecuted = false)
     {
+        int initialDefense = target.Defense;
+        if (amount > 0 && !beforeReceiveExecuted)
+            ExecuteBeforeReceiveDamage(target, source, amount, isCombatDamage);
+        int excess = 0;
+        // i=578 excludes a unit dealer from effect excess; i=985 refreshes oldDefense.
+        if (appliedDamage is null && amount > 0 && source is not null
+            && HasCustomAbility(source, "excess") && !IsUnit(source) && IsUnit(target)
+            && amount > target.Defense)
+        {
+            excess = amount - target.Defense;
+            amount = target.Defense;
+        }
+        oldDefense ??= amount > 0 ? target.Defense : initialDefense;
         // ⚠️ `isCombatDamage` 必须传下去：重甲减伤**只对战斗伤害生效**，
         //    判据与证据链见 `MatchEngine.ApplyDamage` 里那段长注释
         //    （全库 `getTotalHeavyArmor` 的减伤只长在 `CalculateDamageDealt` 里，
@@ -1787,14 +2025,8 @@ public sealed partial class CardApi
         //    `Attack` 传 true（`MatchEngine.cs:1569` 主伤害 / `:1572` 反击），
         //    `DamageCard` / `DamageMultipleCards` / `MakeCardsFight` 都传 false。
         int applied = appliedDamage
-            ?? _engine.ApplyDamage(target, amount, source, isCombatDamage: isCombatDamage);
-
-        // ApplyDamageToCard removes Mobilize only when the resolved damage is
-        // positive. `applied` includes combat-only mitigation such as Heavy Armor.
-        if (applied > 0 && target.Keywords.Contains(Keyword.Mobilize))
-        {
-            RemoveMobilize(target);
-        }
+            ?? _engine.ApplyDamage(target, amount, source, isCombatDamage: isCombatDamage,
+                damageAlreadyCalculated: true);
 
         // ⚠️ 2026-09-30：`damage` 填的是**修正后**的值、`oldDefense` 填的是**结算前**的防御。
         //    证据（`out/bp-cardfn.json` → `ApplyDamageToCard`，123 条语句）：
@@ -1805,27 +2037,15 @@ public sealed partial class CardApi
         //    的出参）与 `oldDefense`。旧实现两个都填**请求值**（P1 重甲那轮记的「没证据」现在有证据了）。
         //    `target.Defense + applied` 而不是 `+ amount`：重甲减伤之后 `applied < amount`，
         //    用 amount 会把 oldDefense 算高（那是重甲那轮留下的偏差，这里一并修正）。
+        bool destroyed = amount > 0 && target.Defense <= 0;
         _engine.FireSubAction("ZActionDamageCard", new[]
         {
             ActionValue2.Int("cardID", target.CardId),
             ActionValue2.Int("damage", amount),
             ActionValue2.Int("oldDefense", oldDefense ?? target.Defense + applied),
-            ActionValue2.Bool("destroyed", target.Defense <= 0),
+            ActionValue2.Bool("destroyed", destroyed),
             ActionValue2.Int("attackerCardID", source?.CardId ?? 0),
         });
-
-        var receiveEventArgs = new object?[] { source, target, isCombatDamage, amount };
-        var receiveNamedArgs = new Dictionary<string, object?>(StringComparer.Ordinal)
-        {
-            ["fromCard"] = source,
-            ["toCard"] = target,
-            ["fromAttack"] = isCombatDamage,
-            ["damage"] = amount,
-        };
-        FireTrigger("OnReceiveDamage", target, target.Owner, "OnOtherCardReceiveDamage",
-            eventArgs: receiveEventArgs,
-            eventSubject: target,
-            namedArgs: receiveNamedArgs);
 
         // ---- 「造成伤害」事件 ----
         //
@@ -1836,27 +2056,132 @@ public sealed partial class CardApi
         //   i=1198 damageDealer.OnCardDealDamage(toCard, damage, isCombatDamage, CounterDamage, isRedirected, out qqq)
         // 触发号 36 的依据：`ERegisteredCardFunction.h` 逐项数下来
         //   0=NotAvailable … 36=OnOtherCardDealDamage（第 37 项）。
-        if (source is not null && source.IsAlive)
-        {
-            var named = new Dictionary<string, object?>(StringComparer.Ordinal)
-            {
-                ["cardDealingDamage"] = source,
-                ["toCard"] = target,
-                ["Damage"] = amount,
-                ["damage"] = amount,
-                ["isCombatDamage"] = isCombatDamage,
-                ["CounterDamage"] = counterDamage,
-                ["isRedirected"] = isRedirected,
-            };
+        if (excess > 0 && source is not null) DealDamage(State.Hq(source.Owner.Opposite()), excess, source);
+        if (amount > 0) ExecuteOnCardDealDamageEffects(target, source, amount, isCombatDamage, counterDamage, isRedirected);
 
-            FireTrigger("OnCardDealDamage", source, source.Owner, "OnOtherCardDealDamage",
-                eventArgs: new object?[] { source, target, amount, isCombatDamage, counterDamage, isRedirected },
-                eventSubject: source, namedArgs: named);
-        }
-
-        if (!deferDestruction && target.Defense <= 0 && !target.IsHq)
+        if (!deferDestruction && destroyed && target.IsHq)
+            State.Finish(target.Owner.Opposite(), "Victory_DestroyHQ");
+        else if (!deferDestruction && destroyed)
         {
             _engine.Destroy(target, source);
+        }
+        else if (!deferDestruction && applied > 0 && target.Keywords.Contains(Keyword.Mobilize))
+            RemoveMobilize(target);
+    }
+
+    /// <summary>ApplyDamageToMultipleCards uses whole-batch phases, never repeated DamageCard calls.</summary>
+    internal IReadOnlyList<int> DealDamageMultiple(IReadOnlyList<CardInstance> targets, int amount, CardInstance? source)
+    {
+        var damage = targets.Select(card => ExecuteOnDealDamageAddDamage(source, card, amount,
+            fromAttack: false, fromFight: false, isDefenderDamage: false)).ToArray();
+        for (int i = 0; i < targets.Count; i++)
+        {
+            var target = targets[i];
+            if (target.Keywords.Contains(Keyword.Immune)) { damage[i] = 0; continue; }
+            // ApplyDamageToMultipleCards i=1061 queries T38 per receiver.
+            // Its direct loop has no NFS deferral or damage-source exclusion.
+            var observers = CaptureRegisteredTriggerSnapshot("OnOtherCardDealDamageAddDamageAfterCalc");
+            foreach (var observer in observers)
+            {
+                var outs = RunOwnLocal(observer, "OnOtherCardDealDamageAddDamageAfterCalc",
+                    new Dictionary<string, object?>
+                    {
+                        ["cardDealingDamage"] = source, ["toCard"] = target,
+                        ["damage"] = damage[i], ["Damage"] = damage[i],
+                        ["isCombatDamage"] = false, ["fromAttack"] = false, ["isRedirected"] = false,
+                    }, "damageToAdd", "stopAdding");
+                if (outs is null) continue;
+                damage[i] = Math.Max(damage[i] + AsInt(outs.GetValueOrDefault("damageToAdd")), 0);
+                if (Blueprint.KismetVm.Truthy(outs.GetValueOrDefault("stopAdding"))) break;
+            }
+        }
+        var receivers = targets.Select((card, i) => (Card: card, Damage: damage[i]))
+            .Where(hit => hit.Damage > 0).ToArray();
+        foreach (var hit in receivers) ExecuteBeforeReceiveDamage(hit.Card, source, hit.Damage, false);
+        var destroyed = new Dictionary<int, (CardInstance Card, CardLocation Location)>();
+        foreach (var hit in receivers)
+        {
+            // Do not recheck immunity or board location after the pre-damage events.
+            hit.Card.Defense -= hit.Damage;
+            if (hit.Card.IsHq) State.UpdateHQDamagedAmountThisTurn(hit.Card.Owner, hit.Damage);
+            if (hit.Card.Defense <= 0) destroyed[hit.Card.CardId] = (hit.Card, hit.Card.Location);
+        }
+        _engine.FireSubAction("ZActionDamageMultipleCards", new[]
+        {
+            ActionValue2.Int("attackerID", source?.CardId ?? 0), ActionValue2.Int("damage", amount),
+        });
+        foreach (var hit in receivers) ExecuteOnCardDealDamageEffects(hit.Card, source, hit.Damage, false, false, false);
+        foreach (var hit in destroyed.Values) _engine.BeforeDestroyed(hit.Card, source, false);
+        foreach (var hit in destroyed.Values)
+            if (hit.Card.Location != CardLocation.Discard) _engine.FireLeaveTrigger(hit.Card, CardLocation.Discard, 1);
+        foreach (var hit in destroyed.Values)
+        {
+            if (hit.Card.IsHq) { State.Finish(hit.Card.Owner.Opposite(), "Victory_DestroyHQ"); continue; }
+            // Native SetCardLocationAndLocNumber skips the number write for Discard.
+            State.Move(hit.Card, CardLocation.Discard, hit.Card.LocationNumber,
+                notifyMoved: false, normalizeLocation: false);
+        }
+        // ApplyDamageToMultipleCards i=4422 records old locations;
+        // i=7136 refreshes them after all moves, before i=7538 callbacks.
+        RefreshLocationStatus(destroyed.Values.Select(hit => hit.Location));
+        var ids = destroyed.Keys.ToArray();
+        foreach (var hit in destroyed.Values)
+            if (!hit.Card.IsHq) _engine.ExecuteOnCardLocationMoved(hit.Card, hit.Location, CardLocation.Discard, false, CardMoveReason.Destroyed);
+        foreach (var hit in destroyed.Values)
+            if (!hit.Card.IsHq) _engine.FireAfterLeaveTrigger(hit.Card, CardLocation.Discard, hit.Location);
+        foreach (var hit in destroyed.Values)
+            if (!hit.Card.IsHq) _engine.ExecuteDestroyed(hit.Card, source, hit.Location, ids, false);
+        foreach (var hit in receivers)
+            if (IsLocatedOnBoard(hit.Card) && hit.Card.Keywords.Contains(Keyword.Mobilize)) RemoveMobilize(hit.Card);
+        _engine.RefreshFrontlineOwner(null);
+        return ids;
+    }
+
+    /// <summary>Blueprint ExecuteBeforeReceiveDamage: self first, before any defense subtraction.</summary>
+    internal void ExecuteBeforeReceiveDamage(CardInstance target, CardInstance? source, int amount, bool combat)
+    {
+        var named = new Dictionary<string, object?>
+        {
+            ["fromCard"] = source, ["toCard"] = target, ["fromAttack"] = combat, ["Damage"] = amount,
+        };
+        if (!target.IsSuppressed)
+            FireTrigger("OnReceiveDamage", target, target.Owner,
+                eventArgs: new object?[] { source, amount }, namedArgs: named);
+        FireTrigger("OnOtherCardReceiveDamage", target, target.Owner,
+            eventArgs: new object?[] { source, target, combat, amount }, eventSubject: target, namedArgs: named);
+    }
+
+    /// <summary>Blueprint damage effects: active countermeasures, unsuppressed dealer, then remaining T36.</summary>
+    internal void ExecuteOnCardDealDamageEffects(CardInstance target, CardInstance? source, int amount,
+        bool combat, bool counterDamage, bool redirected)
+    {
+        var named = new Dictionary<string, object?>
+        {
+            ["cardDealingDamage"] = source, ["toCard"] = target, ["Damage"] = amount,
+            ["isCombatDamage"] = combat, ["CounterDamage"] = counterDamage, ["isRedirected"] = redirected,
+        };
+        var args = new object?[] { source, target, amount, combat, counterDamage, redirected };
+        var done = new HashSet<int>();
+        void Observer(CardInstance observer) => FireTrigger("OnOtherCardDealDamage", observer, observer.Owner,
+            selfProgramName: "OnOtherCardDealDamage", eventSubject: source, eventArgs: args, namedArgs: named);
+        foreach (int id in GetActiveGotchasOrdered())
+        {
+            if (State.StopFurtherActions) return;
+            if (State.ById(id) is { } gotcha) { Observer(gotcha); done.Add(id); }
+        }
+        if (State.StopFurtherActions) return;
+        if (source is not null)
+        {
+            if (!source.IsSuppressed)
+                FireTrigger("OnCardDealDamage", source, source.Owner,
+                    eventArgs: new object?[] { target, amount, combat, counterDamage, redirected }, namedArgs: named);
+            done.Add(source.CardId);
+        }
+        var snapshot = CaptureTriggerSnapshot().Where(x => x.Definition.IsRegisteredFor("OnOtherCardDealDamage")).ToArray();
+        foreach (var observer in snapshot)
+        {
+            if (State.StopFurtherActions) return;
+            if (done.Add(observer.CardId)) Observer(observer);
         }
     }
 
@@ -2037,11 +2362,17 @@ public sealed partial class CardApi
     public static bool IsUnrevealedCovertCard(CardInstance card)
         => card.Keywords.Contains(Keyword.Covert) && !card.IsRevealed;
 
-    /// <summary>逐蓝图执行 `RevealCard(cardID, instigatorID, out qqq)`。</summary>
+    /// <summary>揭示的标志写入、掩护刷新和动作通知先于揭示/入场回调。</summary>
     public int RevealCard(CardInstance card, int instigatorId)
     {
         card.IsRevealed = true;
         card.Keywords.Remove(Keyword.Covert);
+        // Native i=122 refreshes before i=200 notifies and any reveal hook runs.
+        UpdateGuarded(card.Location);
+        _engine.FireSubAction("ZActionRevealCard", new[] {
+            ActionValue2.Int("cardID", card.CardId),
+            ActionValue2.Int("instigatorID", instigatorId) });
+
 
         // RevealCard's JumpIfNot(isSuppressed) sends ordinary targets through
         // their own reveal hook before the observer broadcast. Suppressed
@@ -2138,8 +2469,8 @@ public sealed partial class CardApi
         }
 
         // si=290..905：数「场上**其它**同阵营 Alpine 单位」
-        // （`GetAllUnitsOnBoard(includeCovertCards=False)` —— 内核的
-        //  `GetAllUnitsOnBoard()` 就是"棋盘上的非 HQ 卡"，Covert 未建模）
+        // GetAllUnitsOnBoard(false): positive-defense units in global battle
+        // order, excluding unrevealed Covert cards.
         int bonus = 0;
         foreach (var item in GetAllUnitsOnBoard())
         {
@@ -2178,9 +2509,14 @@ public sealed partial class CardApi
             buff.Duration = duration;
         }
 
+        NotifyAttackChanged(target, delta, source?.CardId ?? target.CardId);
+    }
+
+    private void NotifyAttackChanged(CardInstance target, int delta, int instigatorId)
+    {
         _engine.FireSubAction("ZActionGainAttack", new[]
         {
-            ActionValue2.Int("instigatorID", source?.CardId ?? target.CardId),
+            ActionValue2.Int("instigatorID", instigatorId),
             ActionValue2.Int("gained", delta),
             ActionValue2.Int("newAttackValue", target.Attack),
         });
@@ -2190,11 +2526,11 @@ public sealed partial class CardApi
         //   `OnAfterChangeAttack(int32 changedAmount, int32 instigatorID)`（自己）
         //   `OnAfterOtherCardChangeAttack(UBaseCardObject* cardChanged, int32 changedAmount, int32 instigatorID)`
         FireTrigger("OnAfterChangeAttack", target, target.Owner, "OnAfterOtherCardChangeAttack",
-            eventArgs: new object?[] { target, delta, source?.CardId ?? target.CardId },
+            eventArgs: new object?[] { target, delta, instigatorId },
             namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
             {
                 ["changedAmount"] = delta,
-                ["instigatorID"] = source?.CardId ?? target.CardId,
+                ["instigatorID"] = instigatorId,
                 ["cardChanged"] = target,
             });
     }
@@ -2449,7 +2785,7 @@ public sealed partial class CardApi
     /// `(卡, this.cardID, IntConst:N)`）⇒ `[0]` 目标卡、`[1]` 来源、`[2]` 加多少。
     ///
     /// `changeType=0` 是 `EChangeType::tempBuffGive` ⇒ 登记为临时 buff，
-    /// 在本方回合结束时由 <see cref="RemoveTemporaryBuffs"/> 撤掉。
+    /// 在本方回合结束时由登记表经 <see cref="RemoveBuffsEndOfTurn"/> 撤掉。
     /// </summary>
     public void AddAttackUntilEndOfTurn(CardInstance? target, CardInstance? source, int attackToAdd)
     {
@@ -2462,21 +2798,36 @@ public sealed partial class CardApi
         // 蓝图的 instigatorID 永远是调用者自己，所以这一支只在异常数据下才走。
         var instigator = source ?? target;
         ChangeAttack(target, attackToAdd, instigator, temporary: true);
+        State.AddBuffsToRemoveEndOfTurn(0, instigator.CardId);
     }
 
     /// <summary>
-    /// 撤掉本回合的临时修正 —— `BP_CardFunctions.RemoveBuffsEndOfTurn` 的等价物
-    /// （71 条语句：遍历 buffType → instigatorArray → `GetCardFromID` → `RemoveTheBuff`）。
-    ///
-    /// 蓝图把「待清理」记在 `GameStateRef` 的一张 map 上
-    /// （key = `ECardBuffTypes`，value = 带 `CardIDs` 数组的结构），
-    /// 内核用 <see cref="CardBuff.Temporary"/> 直接标在 buff 上 —— 两者等价，
-    /// 因为清理的粒度就是「(目标卡, 来源) 这一个 buff」。
-    ///
-    /// 调用点：`ExecuteEndOfTurnEvents` 完成整个延迟队列之后、
-    /// `MatchEngine.EndTurn` 的回合数递增之前。
-    /// 顺序有依据 —— 蓝图 `ExecuteEndOfTurnEvents` 先广播 `OnEndOfTurn`，
-    /// 卡自己的收尾逻辑跑完才轮到统一清理。
+    /// Blueprint RemoveBuffsEndOfTurn: traverse explicitly registered source IDs,
+    /// then their current buffed-card arrays. The Blueprint switch handles only
+    /// buffType 0 (attack), on board cards; other fields in the same slot survive.
+    /// Source slots such as Brewster's frontline bonus must not expire implicitly.
+    /// </summary>
+    public void RemoveBuffsEndOfTurn()
+    {
+        foreach (var (buffType, sources) in State.GetBuffsToRemoveEndOfTurn())
+        {
+            foreach (int sourceId in sources)
+            {
+                if (State.ById(sourceId) is not { } source) continue;
+                foreach (int targetId in source.CardsBuffedByThisCard.ToArray())
+                    if (buffType == 0 && State.ById(targetId) is { } target && target.Location.IsBoard()
+                        && target.BuffsBySource.TryGetValue((sourceId, true), out var buff)
+                        && buff.Attack != 0)
+                        RemoveAttackBuff(target, sourceId, notify: true);
+            }
+        }
+        State.ClearBuffsToRemoveEndOfTurn();
+    }
+
+    /// <summary>
+    /// Explicit compatibility cleanup for callers that request removal of every
+    /// temporary source slot. Actual turn-end processing uses the registered,
+    /// stat-specific <see cref="RemoveBuffsEndOfTurn"/> Blueprint contract instead.
     /// </summary>
     public void RemoveTemporaryBuffs()
     {
@@ -2497,7 +2848,7 @@ public sealed partial class CardApi
 
             foreach (var (key, buff) in doomed)
             {
-                card.BuffsBySource.Remove(key);
+                RemoveBuffEntry(card, key);
 
                 bool operationCostReset = buff.OperationCost != 0
                     || buff.OperationCostSetsAbsoluteValue;
@@ -2585,7 +2936,8 @@ public sealed partial class CardApi
     /// （i=680）与 `LoseKreditSlot`（i=574），签名 `BaseCardObject.h:817`：
     /// <code>void OnAfterExtraKreditSlotGain(UBaseCardObject* cardGivingKredit,
     ///                                      ESideEnum sideGaining, bool isNegativeGain);</code>
-    /// 没有「自己/别人」两个变体 —— 它是**广播给所有订阅者**的（`giver` 作为事件参数）。
+    /// 当前 pak: Gain i=180 / Lose i=88 遍历 GetAllCardInBattle，未查询 usedTriggers。
+    /// Gain i=500 / Lose i=404 直接跳过 isSuppressed，不应用抑制例外或位置门。
     /// </summary>
     public void FireExtraKreditSlotGain(Side side, int count, CardInstance? giver)
         => FireTrigger("OnAfterExtraKreditSlotGain", null, side,
@@ -2596,7 +2948,8 @@ public sealed partial class CardApi
                 ["cardGivingKredit"] = giver,
                 ["sideGaining"] = (int)side,
                 ["isNegativeGain"] = count < 0,
-            });
+            }, recipientSnapshot: State.AllCardsInBattleOrder, requireRegistration: false,
+            allowSuppressionExceptions: false, includeUnavailableRecipients: true);
 
     public void DrawCards(Side side, int count) => DrawCardsAndCollect(side, count);
 
@@ -2632,33 +2985,39 @@ public sealed partial class CardApi
     /// <item>元素是**整数 cardID**，不是卡实例 —— 蓝图的 `drawnCards` 是 `TArray&lt;int&gt;`，
     ///       元素直接喂 `GetCardFromID`（`card_event_pact_of_steel` i=151）。
     ///       口径与 <see cref="GetDeckBySide"/> 一致；返回卡实例会让 `AsInt(实例)=0`。</item>
-    /// <item><c>DrawCard</c> 返回 null 的两条路径（牌库空 → 疲劳伤害 / 手牌满 → 烧牌）
-    ///       **都不入列**，对应蓝图 `if (drawnCard &gt; 0)` 那道门。
-    ///       ⚠️ 已知偏差：蓝图的 `DrawTopCardFromDeck` 在**手牌满**时仍返回 `drawnCardID`
-    ///       （`g.cs:12558` 的 `L["drawnCard"] = drawnCardID` 在 `isHandFull` 分支汇合之后），
-    ///       也就是"烧掉的那张"也进 `drawnCards`；而 `MatchEngine.DrawCard` 在烧牌时返回 null
-    ///       （`MatchEngine.cs:713-726`），这里就收不到。要完全对齐需要引擎给出"被烧的是哪张"，
-    ///       本轮**不改** `MatchEngine.cs`（它同时被另一处改动占用）。</item>
+    /// <item>蓝图返回的是从牌库移出的卡 ID，手牌满时也包括被烧掉的卡；只有牌库空、没有卡 ID
+    ///       的疲劳路径不入列。引擎的 <c>DrawCard</c> 对烧牌返回 null，因此在调用引擎前记录牌库顶卡，
+    ///       用它构造蓝图出参，同时保留 <c>DrawCard</c> 表示“是否进入手牌”的返回语义。</item>
     /// </list>
     /// </summary>
-    public List<int> DrawCardsAndCollect(Side side, int count)
+    public List<int> DrawCardsAndCollect(Side side, int count, int instigatorId = 0, bool cardSeen = false, bool opponentDraw = false)
     {
         var drawn = new List<int>();
         for (int i = 0; i < count; i++)
         {
-            if (_engine.DrawCard(side) is { } card)
+            // DrawTopCardFromDeck returns the removed card ID even when a full hand burns it.
+            var topCard = State.Deck(side).FirstOrDefault();
+            _engine.DrawCard(side, instigatorId: instigatorId, cardSeen: cardSeen, opponentDraw: opponentDraw);
+            if (topCard is not null)
             {
-                drawn.Add(card.CardId);
+                drawn.Add(topCard.CardId);
             }
         }
 
         return drawn;
     }
 
-    /// <summary>把一张卡生成到手牌（对应 SpawnCardInHandBySide / doSpawnCardInHand）。</summary>
-    public CardInstance SpawnCardInHand(Side side, string cardName)
+    /// <summary>生成手牌并适配满手/生成事件/自动打出入队；完整CreateCard通知仍待审计（RULE-114）。</summary>
+    public CardInstance SpawnCardInHand(Side side, string cardName, bool isGold = false,
+        bool isSalvaged = false, string? salvageFaction = null, bool? cardSeen = null)
     {
-        var card = State.Create(cardName, side, side.HandOf(), State.NextLocationNumber(side, side.HandOf()));
+        // CreateCard i=244/276 saves capacity before own creation and T35.
+        bool wasFull = CountCardsForHandCapacity(side.HandOf()) >= GameState.HandCapacity;
+        var card = State.Create(cardName, side, side.HandOf(), State.NextLocationNumber(side, side.HandOf()),
+            isGold: isGold, isSalvaged: isSalvaged, salvageFaction: salvageFaction, cardSeenBeforeModifiers: cardSeen);
+        // i=2212..2399 uses the post-T35 tag but the saved pre-creation fullness.
+        // This is a direct field write, with no discard events or renumbering.
+        if (wasFull && !HasInstanceGameplayTag(card, "autoplay")) card.Location = CardLocation.Discard;
         _engine.FireSubAction("ZActionSpawnCard", new[]
         {
             ActionValue2.Int("cardID", card.CardId),
@@ -2666,6 +3025,8 @@ public sealed partial class CardApi
         });
 
         ExecuteOnSpawnedInHandEvents(card, side);
+        // i=2592..2721 re-reads both hand location and autoplay after own/T57.
+        if (IsLocatedInHand(card) && HasInstanceGameplayTag(card, "autoplay")) State.AddAutoPlayCards(card.CardId);
         return card;
     }
 
@@ -2727,22 +3088,32 @@ public sealed partial class CardApi
 
     private void ExecuteOnSpawnedInHandEvents(CardInstance card, Side side)
     {
-        // `ExecuteOnSpawnedInHandEvents`: own event first, then the broadcast event.
-        FireTrigger("OnCardSpawnedInHand", card, side,
-            eventArgs: new object?[] { (int)side },
-            namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-            {
-                ["spawnedSide"] = (int)side,
-            });
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        int spawnedCardId = card.CardId;
+        // Pak i=38 resolves the ID; i=132 calls the valid object's own event
+        // without suppression, registration or location gates.
+        var spawned = State.ById(spawnedCardId);
+        if (spawned is not null && library.FindProgram(spawned.Name, "OnCardSpawnedInHand") is not null)
+        {
+            TriggerTrace?.Add($"OnCardSpawnedInHand → {spawned.Name}#{spawned.CardId}（eventCard={spawned.Name}#{spawned.CardId}）");
+            RunTriggerProgram(library, spawned, spawned.Name, "OnCardSpawnedInHand", spawned,
+                eventArgs: new object?[] { (int)side },
+                namedArgs: new Dictionary<string, object?> { ["spawnedSide"] = (int)side });
+        }
 
-        FireTrigger("OnOtherCardSpawnedInHand", card, side,
-            eventArgs: new object?[] { card.CardId, (int)side },
-            eventSubject: card,
-            namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-            {
-                ["spawnedCardID"] = card.CardId,
-                ["spawnedSide"] = (int)side,
-            });
+        const string trigger = "OnOtherCardSpawnedInHand";
+        // i=177 queries T57 after the own event. Unlike query-time exceptions,
+        // i=654 unconditionally skips currently suppressed saved recipients.
+        var recipients = CaptureRegisteredTriggerSnapshot(trigger);
+        var args = new object?[] { spawnedCardId, (int)side };
+        var named = new Dictionary<string, object?> { ["spawnedCardID"] = spawnedCardId, ["spawnedSide"] = (int)side };
+        foreach (var observer in recipients)
+        {
+            if (observer.CardId == spawnedCardId || observer.IsSuppressed || library.FindProgram(observer.Name, trigger) is null) continue;
+            TriggerTrace?.Add($"{trigger} → {observer.Name}#{observer.CardId}（eventCardID={spawnedCardId}）");
+            RunTriggerProgram(library, observer, observer.Name, trigger, spawned, eventArgs: args, namedArgs: named);
+        }
     }
 
     /// <summary>把一张卡生成到战场（对应 `SpawnCardOnBattlefield`）。</summary>
@@ -2791,11 +3162,6 @@ public sealed partial class CardApi
         //   L_0400  UpdateFrontlineIfNeeded(spawnedID)   ← ★ 就是这一句
         // </code>
         // `SpawnMultipleCardsOnBattlefield`（同文件 L_0AD6）也有一句同样的调用。
-        if (where == CardLocation.BoardFrontline)
-        {
-            _engine.RefreshFrontlineOwner(card);
-        }
-
         if (newGiveBlitz)
         {
             card.Keywords.Add(Keyword.Blitz);
@@ -2812,6 +3178,13 @@ public sealed partial class CardApi
         // `tmpCardToSet.location = Location`）里就已经设好，且 si=1838 在 si=872 之前可达 ——
         // 所以这里放在 `State.Move` **之后**，与蓝图同序（详见 `GiveAlpineBonus` 的注释）。
         GiveAlpineBonus(card);
+        RefreshLocationStatus(new[] { where });
+
+        _engine.ExecuteOnCardLocationMoved(card, CardLocation.NotAvailable, where);
+        if (where == CardLocation.BoardFrontline)
+        {
+            _engine.RefreshFrontlineOwner(card);
+        }
 
         _engine.FireSubAction("ZActionSpawnCard", new[]
         {
@@ -2832,60 +3205,274 @@ public sealed partial class CardApi
         _engine.Destroy(target, source);
     }
 
-    /// <summary>
-    /// 弃一张牌（对应 `BP_CardFunctions::DiscardCardFromHand` / `DiscardCard`）。
-    ///
-    /// <paramref name="discarder"/> 是"谁弃的"（事件第 2 个入参 `discarderID`）。
-    /// 内核大量调用点是"效果让某张牌被弃"，没有明确的施加者，
-    /// 这时传 null ⇒ `discarderID = 0`。**这是近似**，不猜一个假的施动者。
-    /// </summary>
-    public void DiscardCard(CardInstance card, CardInstance? discarder = null)
+    /// <summary>DiscardCardFromHand(cardID, 0, false, true), used by blocked direct play.</summary>
+    internal void ForceDiscardHandCardForBlockedDirectPlay(CardInstance card)
+        => DiscardHandCard(card, 0, skipSubAction: false, forceDiscard: true);
+
+    // BP_CardFunctions.DiscardCardFromHand, rule-processing branch.
+    private bool DiscardHandCard(CardInstance card, int discarderId, bool skipSubAction, bool forceDiscard)
     {
-        bool discardedFromHand = card.Location == card.Owner.HandOf();
-        if (card.Location == card.Owner.HandOf()
-            && State.HasGameplayRestriction(card.Owner,
-                GameplayRestrictionType.CannotDiscardAnyCardFromHand))
+        CardLocation old = card.Location;
+        if (card.CardId <= 0 || old is not (CardLocation.HandLeft or CardLocation.HandRight)) return false;
+        // i=196 saves the old hand before callbacks, which may move the card.
+        if (!forceDiscard)
         {
-            return;
+            if (State.HasGameplayRestriction(card.Owner, GameplayRestrictionType.CannotDiscardAnyCardFromHand))
+                return false;
+            if (!card.IsSuppressed)
+            {
+                var result = RunOwnLocal(card, "OnAttemptedDiscard",
+                    new Dictionary<string, object?> { ["discarderID"] = discarderId }, "cancelDiscard");
+                if (result is not null && KismetVmTruthy(result.GetValueOrDefault("cancelDiscard"))) return false;
+            }
         }
-
-        bool suppressed = card.Keywords.Contains(Keyword.Suppressed);
-        State.Move(card, CardLocation.Discard);
-        _engine.FireSubAction("ZActionDiscardCard", new[]
+        // SetCardLocationAndLocNumber's discard branch preserves locationNumber.
+        card.Location = CardLocation.Discard;
+        card.RecalculateStats();
+        RearrangeLocation(old);
+        Blueprint.LiveRuleTables.TryGetEnumName("/Script/kards.ECardLocationEnum", (int)old, out string oldName);
+        if (!skipSubAction) _engine.FireSubAction("ZActionDiscardCard", new[]
         {
-            ActionValue2.Int("discarderID", discarder?.CardId ?? card.CardId),
+            ActionValue2.Int("cardID", card.CardId),
+            ActionValue2.Int("discarderID", discarderId),
+            ActionValue2.Str("oldLocation", oldName),
         });
-
-        int discarderId = discarder?.CardId ?? 0;
-
-        // DiscardCardFromHand invokes the discarded card's hook before notifying observers.
-        if (discardedFromHand && !suppressed)
-        {
+        // ForceDiscard bypasses restriction and attempted-cancel checks only.
+        if (!card.IsSuppressed)
             FireTrigger("OnSuccesfulDiscard", card, card.Owner,
                 eventArgs: new object?[] { discarderId },
-                namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-                {
-                    ["discarderID"] = discarderId,
-                });
+                namedArgs: new Dictionary<string, object?> { ["discarderID"] = discarderId });
+        const string trigger = "OnOtherCardDiscarded";
+        var recipients = CaptureRegisteredTriggerSnapshot(trigger);
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return true;
+        var args = new object?[] { card, discarderId };
+        var named = new Dictionary<string, object?> { ["cardDiscarded"] = card, ["discarderID"] = discarderId };
+        foreach (var observer in recipients)
+        {
+            if (library.FindProgram(observer.Name, trigger) is null) continue;
+            TriggerTrace?.Add($"{trigger} → {observer.Name}#{observer.CardId}（eventCard={card.Name}#{card.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, trigger, card, eventArgs: args, namedArgs: named);
+        }
+        return true; // Native success is independent of the location after callbacks.
+    }
+
+    /// <summary>Discard a hand card with normal restriction and attempted-cancel checks.</summary>
+    public void DiscardCard(CardInstance card, CardInstance? discarder = null)
+        => DiscardHandCard(card, discarder?.CardId ?? 0, skipSubAction: false, forceDiscard: false);
+
+    // GiveFury keeps the raw flag separate from receivedAbilitiesFromCards.
+    // Any nonzero source (including a negative ID) uses the source branch.
+    public void GiveFury(CardInstance target, int giverId = 0)
+    {
+        if (!CanCardBeBuffed(target)) return;
+        bool alreadyHadFury = false;
+        if (giverId == 0)
+        {
+            if (target.Keywords.Contains(Keyword.Fury)) return;
+        }
+        else
+        {
+            alreadyHadFury = target.HasFury;
+            if (target.ReceivedAbilitiesFromCards.TryGetValue("fury", out var existing)
+                && existing.Contains(giverId)) return;
         }
 
-        // `DiscardCardFromHand` broadcasts even when the discarded card is suppressed;
-        // suppression filters each observer, while the discarded card's own hook above is skipped.
-        //   si=536  FetchAllCardsWithEventTrigger(41)
-        //   si=809  item.OnOtherCardDiscarded(tmpCardToDiscard, discarderID)
-        // 广播集**不排除被弃的那张卡自己**（蓝图里没有 cardID 比对），
-        // 但内核 FireTrigger 的 `OnOther*` 约定会排除主体 —— 见 FireTrigger 的注释。
-        FireTrigger("OnOtherCardDiscarded", card, card.Owner,
-            eventArgs: new object?[] { card, discarderId },
-            eventSubject: card,
-            namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-            {
-                ["cardDiscarded"] = card,
-                ["discarderID"] = discarderId,
-            });
+        int left = target.RemainingAttacks;
+        int count = target.AttacksThisTurn;
+        if (giverId == 0) target.Keywords.Add(Keyword.Fury);
+        else
+        {
+            if (!target.ReceivedAbilitiesFromCards.TryGetValue("fury", out var givers))
+                target.ReceivedAbilitiesFromCards["fury"] = givers = new List<int>();
+            ChangeFuryBuff(target, giverId, 1);
+            givers.Add(giverId);
+        }
+        bool addsAttack = !alreadyHadFury && count < 2 && (count == 1 || left > 0);
+        target.SetRemainingAttacks(left + (addsAttack ? 1 : 0));
+        if (!IsLocatedInDeck(target))
+            _engine.FireSubAction("ZActionGiveFury", new[] {
+                ActionValue2.Int("cardID", target.CardId), ActionValue2.Int("giverID", giverId) });
+        FireAbilitiesChanged(target);
+    }
+
+    // Positive IDs remove one registered source. Nonpositive IDs remove all.
+    public void RemoveFury(CardInstance target, int giverId = 0, bool skipAction = false)
+    {
+        int left = target.RemainingAttacks;
+        if (giverId <= 0)
+        {
+            if (!target.HasFury) return;
+            if (target.ReceivedAbilitiesFromCards.TryGetValue("fury", out var all))
+                foreach (int source in all) ChangeFuryBuff(target, source, -1);
+            target.Keywords.Remove(Keyword.Fury);
+            target.ReceivedAbilitiesFromCards.Remove("fury");
+        }
+        else
+        {
+            if (!target.ReceivedAbilitiesFromCards.TryGetValue("fury", out var givers)
+                || givers.RemoveAll(source => source == giverId) == 0) return;
+            ChangeFuryBuff(target, giverId, -1);
+            // The Blueprint writes back the list even when it is empty.
+        }
+        target.SetRemainingAttacks(target.HasFury ? left
+            : target.AttacksThisTurn != 0 ? 0 : Math.Min(left, 1));
+        if (!skipAction)
+            _engine.FireSubAction("ZActionRemoveFury", new[] {
+                ActionValue2.Int("cardID", target.CardId), ActionValue2.Int("giverID", giverId) });
+        FireAbilitiesChanged(target);
+    }
+
+    private void ChangeFuryBuff(CardInstance target, int sourceId, int amount)
+    {
+        var key = (sourceId, false);
+        var buff = GetOrCreateBuff(target, sourceId);
+        buff.Fury += amount;
+        if (buff.IsEmpty) RemoveBuffEntry(target, key);
+    }
+
+    // GiveBlitz i895 and i973 are separate T29 queries. The first runs only
+    // when effective Blitz changed; notification lies between them outside deck.
+    public void GiveBlitz(CardInstance target, int giverId = 0)
+    {
+        if (!CanCardBeBuffed(target)) return;
+        bool alreadyHad = target.HasBlitz;
+        if (giverId == 0)
+        {
+            if (target.Keywords.Contains(Keyword.Blitz)) return;
+            target.Keywords.Add(Keyword.Blitz);
+        }
+        else
+        {
+            if (!target.ReceivedAbilitiesFromCards.TryGetValue("blitz", out var givers))
+                target.ReceivedAbilitiesFromCards["blitz"] = givers = new List<int>();
+            if (givers.Contains(giverId)) return;
+            ChangeBlitzBuff(target, giverId, 1);
+            givers.Add(giverId);
+        }
+        if (target.HasBlitz != alreadyHad) FireAbilitiesChanged(target);
+        if (!IsLocatedInDeck(target))
+            _engine.FireSubAction("ZActionGiveBlitz", new[] {
+                ActionValue2.Int("cardID", target.CardId), ActionValue2.Int("giverID", giverId) });
+        FireAbilitiesChanged(target);
+    }
+
+    public void RemoveBlitz(CardInstance target, int giverId = 0, bool skipAction = false)
+    {
+        bool alreadyHad = target.HasBlitz;
+        if (giverId <= 0)
+        {
+            if (!alreadyHad) return;
+            if (target.ReceivedAbilitiesFromCards.TryGetValue("blitz", out var all))
+                foreach (int source in all) ChangeBlitzBuff(target, source, -1);
+            target.Keywords.Remove(Keyword.Blitz);
+            target.ReceivedAbilitiesFromCards.Remove("blitz");
+        }
+        else
+        {
+            if (!target.ReceivedAbilitiesFromCards.TryGetValue("blitz", out var givers)
+                || givers.RemoveAll(source => source == giverId) == 0) return;
+            ChangeBlitzBuff(target, giverId, -1);
+        }
+        if (target.HasBlitz != alreadyHad) ExecuteOtherCardBlitzChanged(target);
+        if (!skipAction)
+            _engine.FireSubAction("ZActionRemoveBlitz", new[] {
+                ActionValue2.Int("cardID", target.CardId), ActionValue2.Int("giverID", giverId) });
+        FireAbilitiesChanged(target);
+    }
+
+    private void ChangeBlitzBuff(CardInstance target, int sourceId, int amount)
+    {
+        var key = (sourceId, false);
+        var buff = GetOrCreateBuff(target, sourceId);
+        buff.Blitz += amount;
+        if (buff.IsEmpty) RemoveBuffEntry(target, key);
+    }
+
+    private void ExecuteOtherCardBlitzChanged(CardInstance changed)
+    {
+        const string trigger = "OnOtherCardBlitzChanged";
+        var recipients = CaptureRegisteredTriggerSnapshot(trigger);
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        var args = new object?[] { changed };
+        var named = new Dictionary<string, object?> { ["cardChanged"] = changed };
+        foreach (var observer in recipients)
+        {
+            if (library.FindProgram(observer.Name, trigger) is null) continue;
+            TriggerTrace?.Add($"{trigger} → {observer.Name}#{observer.CardId}（eventCard={changed.Name}#{changed.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, trigger, changed, eventArgs: args, namedArgs: named);
+        }
     }
 
     public void GiveKeyword(CardInstance target, string keyword)
+    {
+        if (keyword == Keyword.Pinned) { PinUnit(target); return; }
+        if (keyword == Keyword.Fury) { GiveFury(target); return; }
+        if (keyword == Keyword.Blitz) { GiveBlitz(target); return; }
+        if (keyword == Keyword.Smokescreen) { GiveSmokescreen(target); return; }
+        if (keyword == Keyword.Guard) { GiveGuard(target); return; }
+        GiveKeywordCore(target, keyword);
+    }
+
+    // GiveGuard continues from positive-source registration to the raw-flag branch.
+    // An already-raw Guard only notifies; a newly-raw Guard removes all smoke.
+    public void GiveGuard(CardInstance target, int instigatorId = 0)
+    {
+        if (!CanCardBeBuffed(target)) return;
+        if (instigatorId > 0)
+        {
+            if (target.ReceivedAbilitiesFromCards.TryGetValue("guard", out var prior)
+                && prior.Contains(instigatorId)) return;
+            var sources = prior is null ? new List<int>() : new List<int>(prior);
+            sources.Add(instigatorId);
+            ChangeGuardBuff(target, instigatorId, 1);
+            target.ReceivedAbilitiesFromCards["guard"] = sources;
+        }
+        bool alreadyRaw = target.Keywords.Contains(Keyword.Guard);
+        if (!alreadyRaw) target.Keywords.Add(Keyword.Guard);
+        bool inDeck = IsLocatedInDeck(target);
+        if (!inDeck)
+        {
+            var values = new List<ActionValue2> { ActionValue2.Int("cardID", target.CardId) };
+            if (instigatorId != 0) values.Add(ActionValue2.Int("instigatorID", instigatorId));
+            _engine.FireSubAction("ZActionGiveGuard", values);
+        }
+        if (alreadyRaw) return;
+        if (!inDeck) UpdateGuarded(target.Location);
+        RemoveSmokescreen(target, instigatorId, removeAllGivers: true, skipAction: inDeck);
+        FireAbilitiesChanged(target);
+    }
+
+    // GiveSmokescreen uses positive sources; zero/negative giver sets only raw state.
+    public void GiveSmokescreen(CardInstance target, int giverId = 0)
+    {
+        if (!CanCardBeBuffed(target)) return;
+        if (giverId > 0)
+        {
+            if (target.ReceivedAbilitiesFromCards.TryGetValue("smokescreen", out var prior)
+                && prior.Contains(giverId)) return;
+            var sources = prior is null ? new List<int>() : new List<int>(prior);
+            sources.Add(giverId);
+            ChangeSmokescreenBuff(target, giverId, 1);
+            target.ReceivedAbilitiesFromCards["smokescreen"] = sources;
+        }
+        else
+        {
+            if (target.Keywords.Contains(Keyword.Smokescreen)) return;
+            target.Keywords.Add(Keyword.Smokescreen);
+        }
+        if (!IsLocatedInDeck(target))
+        {
+            var values = new List<ActionValue2> { ActionValue2.Int("cardID", target.CardId) };
+            if (giverId != 0) values.Add(ActionValue2.Int("giverID", giverId));
+            _engine.FireSubAction("ZActionGiveSmokescreen", values);
+        }
+        RemoveGuard(target, target.CardId, removeAllGivers: false, skipAction: true);
+        FireAbilitiesChanged(target);
+    }
+
+    private void GiveKeywordCore(CardInstance target, string keyword)
     {
         if (!target.IsAlive || !CanCardBeBuffed(target))
         {
@@ -2996,17 +3583,19 @@ public sealed partial class CardApi
 
     public void RemoveKeyword(CardInstance target, string keyword)
     {
+        if (keyword == Keyword.Pinned) { RemovePin(target); return; }
+        if (keyword == Keyword.Fury) { RemoveFury(target); return; }
+        if (keyword == Keyword.Blitz) { RemoveBlitz(target); return; }
+        if (keyword == Keyword.Smokescreen) { RemoveSmokescreen(target); return; }
+        if (keyword == Keyword.Guard) { RemoveGuard(target); return; }
+        RemoveKeywordCore(target, keyword);
+    }
+
+    private void RemoveKeywordCore(CardInstance target, string keyword)
+    {
         if (!target.Keywords.Remove(keyword))
         {
             return;
-        }
-
-        // ★ 钉住被摘掉时把剩余回合数清零 —— 蓝图 `RemovePin` i=1273
-        //   （`BP_CardFunctions.g.cs:31799`）就是 `card.pinnedTurns = 0`。
-        //   不清的话，下一次再被钉住时 `Max(旧值, 3或2)` 会把时长算长。
-        if (keyword == Keyword.Pinned)
-        {
-            target.PinnedTurns = 0;
         }
 
         _engine.FireSubAction($"ZActionRemove{keyword}", new[]
@@ -3015,41 +3604,149 @@ public sealed partial class CardApi
         });
 
         FireAbilitiesChanged(target);
-        if (keyword == Keyword.Blitz)
-        {
-            FireTrigger("OnOtherCardBlitzChanged", target, target.Owner,
-                eventArgs: new object?[] { target }, eventSubject: target,
-                namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-                {
-                    ["cardChanged"] = target,
-                });
-        }
+    }
 
-        if (keyword == Keyword.Smokescreen)
+    // BP UpdateGuarded updates an explicit cache only for board locations.
+    // Current-card effective Guard differs from adjacent-card raw Guard.
+    public void UpdateGuarded(CardLocation location)
+    {
+        if (!location.IsBoard()) return;
+        var cards = State.AllCardsInBattleOrder.Where(c => c.Location == location).ToArray();
+        foreach (var card in cards)
         {
-            FireTrigger("OnOtherCardLoseSmokescreen", target, target.Owner,
-                eventArgs: new object?[] { target }, eventSubject: target,
-                namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-                {
-                    ["card"] = target,
-                });
+            if (card.HasGuard && !IsUnrevealedCovertCard(card))
+            {
+                card.IsBeingGuarded = false;
+                continue;
+            }
+            // GetAdjacentCards(card,true) selects up to two physical neighbors
+            // before UpdateGuarded filters hidden Covert and raw hasGuard.
+            int lower = unchecked(card.LocationNumber - 1), higher = unchecked(card.LocationNumber + 1);
+            card.IsBeingGuarded = cards
+                .Where(other => other.LocationNumber == lower || other.LocationNumber == higher)
+                .Take(2).Any(other => other.Keywords.Contains(Keyword.Guard) && !IsUnrevealedCovertCard(other));
         }
+    }
 
-        if (keyword == Keyword.Pinned)
+    // Guard withdrawal differs from smoke: last-source removal clears the raw
+    // flag/key, and the tail tests raw Guard rather than the effective getter.
+    public void RemoveGuard(CardInstance target, int instigatorId = 0,
+        bool removeAllGivers = true, bool skipAction = false)
+    {
+        bool hasSources = target.ReceivedAbilitiesFromCards.TryGetValue("guard", out var sources);
+        if (instigatorId <= 0 || removeAllGivers)
         {
-            FireTrigger("OnOtherUnitUnpinned", target, target.Owner,
-                eventArgs: new object?[] { target }, eventSubject: target,
-                namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-                {
-                    ["card"] = target,
-                });
+            if (!target.HasGuard) return;
+            if (hasSources)
+            {
+                if (instigatorId > 0 && !sources!.Contains(instigatorId))
+                    ChangeGuardBuff(target, instigatorId, -1);
+                foreach (int source in sources!.ToArray()) ChangeGuardBuff(target, source, -1);
+            }
+            else if (instigatorId > 0) ChangeGuardBuff(target, instigatorId, -1);
+            target.Keywords.Remove(Keyword.Guard);
+            target.ReceivedAbilitiesFromCards.Remove("guard");
+        }
+        else
+        {
+            if (!hasSources || !sources!.Contains(instigatorId)) return;
+            var remaining = sources!.Where(id => id != instigatorId).ToList();
+            ChangeGuardBuff(target, instigatorId, -1);
+            if (remaining.Count == 0)
+            {
+                target.Keywords.Remove(Keyword.Guard);
+                target.ReceivedAbilitiesFromCards.Remove("guard");
+            }
+            else target.ReceivedAbilitiesFromCards["guard"] = remaining;
+        }
+        if (!skipAction)
+        {
+            _engine.FireSubAction("ZActionRemoveGuard", new[] {
+                ActionValue2.Int("cardID", target.CardId),
+                ActionValue2.Int("instigatorID", instigatorId),
+                ActionValue2.Bool("RemoveAllGivers", removeAllGivers) });
+        }
+        if (target.Keywords.Contains(Keyword.Guard)) return;
+        UpdateGuarded(target.Location);
+        FireAbilitiesChanged(target);
+    }
+
+    private void ChangeGuardBuff(CardInstance target, int sourceId, int amount)
+    {
+        var buff = GetOrCreateBuff(target, sourceId);
+        buff.Guard += amount;
+        if (buff.IsEmpty) RemoveBuffEntry(target, (sourceId, false));
+    }
+
+    // Blueprint RemoveSmokescreen: nonpositive giver or RemoveAll clears raw
+    // and all registrations; a positive individual giver only removes that source.
+    public void RemoveSmokescreen(CardInstance target, int giverId = 0,
+        bool removeAllGivers = true, bool skipAction = false)
+    {
+        bool hasSources = target.ReceivedAbilitiesFromCards.TryGetValue("smokescreen", out var sources);
+        if (giverId <= 0 || removeAllGivers)
+        {
+            if (!target.HasSmokescreen) return;
+            if (hasSources)
+            {
+                if (giverId > 0 && !sources!.Contains(giverId)
+                    && State.Database.Find(target.Name)?.Keywords.Contains(Keyword.Smokescreen) == true)
+                    ChangeSmokescreenBuff(target, giverId, -1);
+                foreach (int source in sources!.ToArray()) ChangeSmokescreenBuff(target, source, -1);
+            }
+            else if (giverId > 0) ChangeSmokescreenBuff(target, giverId, -1);
+            target.Keywords.Remove(Keyword.Smokescreen);
+            target.ReceivedAbilitiesFromCards.Remove("smokescreen");
+        }
+        else
+        {
+            if (!hasSources || !sources!.Contains(giverId)) return;
+            sources!.RemoveAll(id => id == giverId);
+            ChangeSmokescreenBuff(target, giverId, -1);
+            // Map_Add writes an empty array back rather than removing the key.
+        }
+        if (!skipAction)
+        {
+            var values = new List<ActionValue2> {
+                ActionValue2.Int("cardID", target.CardId), ActionValue2.Bool("RemoveAllGivers", removeAllGivers) };
+            if (giverId != 0) values.Add(ActionValue2.Int("giverID", giverId));
+            _engine.FireSubAction("ZActionRemoveSmokescreen", values);
+        }
+        if (target.HasSmokescreen) return;
+        ExecuteSmokescreenLossEvents(target);
+        FireAbilitiesChanged(target);
+    }
+
+    private void ChangeSmokescreenBuff(CardInstance target, int sourceId, int amount)
+    {
+        var key = (sourceId, false);
+        var buff = GetOrCreateBuff(target, sourceId);
+        buff.Smokescreen += amount;
+        if (buff.IsEmpty) RemoveBuffEntry(target, key);
+    }
+
+    // RemoveSmokescreen i=2459 queries T48, including the changed card.
+    // i=2732 invokes each saved object before i=2852 queries ability changes.
+    private void ExecuteSmokescreenLossEvents(CardInstance target)
+    {
+        const string trigger = "OnOtherCardLoseSmokescreen";
+        var recipients = CaptureRegisteredTriggerSnapshot(trigger);
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        var args = new object?[] { target };
+        var named = new Dictionary<string, object?> { ["cardLostSmokescreen"] = target };
+        foreach (var observer in recipients)
+        {
+            if (library.FindProgram(observer.Name, trigger) is null) continue;
+            TriggerTrace?.Add($"{trigger} → {observer.Name}#{observer.CardId}（eventCard={target.Name}#{target.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, trigger, target, eventArgs: args, namedArgs: named);
         }
     }
 
     /// <summary>
     /// 钉住一个单位（对应 `BP_CardFunctions::PinUnit`，`BP_CardFunctions.g.cs:27852`）。
     ///
-    /// 与 <see cref="SuppressUnit"/> 同构：加关键字 + **记下时长**。
+    /// 按来源记录pinned能力与战斗账本；重复来源直接返回。
     /// 时长照 `PinUnit` i=955（`BP_CardFunctions.g.cs:27957-27964`）：
     /// <code>
     ///   IsSideActive(_card, _card.side) -> active
@@ -3066,26 +3763,52 @@ public sealed partial class CardApi
     /// `IsLocatedOnBoard` / `i=266` `IsUnit`）；任一不满足都直接返回，不写
     /// `pinnedTurns`、不加关键字、也不派发钉住事件。
     /// </summary>
-    public void PinUnit(CardInstance target)
+    public void PinUnit(CardInstance target, int instigatorId = 0)
     {
-        if (HasCustomAbility(target, "cantBePinned")
-            || !IsLocatedOnBoard(target)
-            || !IsUnit(target))
+        if (HasCustomAbility(target, "cantBePinned") || !IsLocatedOnBoard(target) || !IsUnit(target)) return;
+        if (target.ReceivedAbilitiesFromCards.TryGetValue("pinned", out var sources) && sources.Contains(instigatorId)) return;
+        ChangePinnedLedger(target, instigatorId, 1);
+        if (sources is null) target.ReceivedAbilitiesFromCards["pinned"] = sources = new List<int>();
+        sources.Add(instigatorId);
+        target.PinnedTurns = Math.Max(target.PinnedTurns, IsSideActive(target.Owner) ? 3 : 2);
+        _engine.FireSubAction("ZActionPinUnit", new[] {
+            ActionValue2.Int("cardID", target.CardId), ActionValue2.Int("instigatorID", instigatorId),
+        });
+        FirePinChanged(target, true);
+    }
+
+    public void RemovePin(CardInstance target)
+    {
+        if (!target.IsPinned) return;
+        // The authoritative RemovePin loops a saved array but does not remove
+        // the pinned source-map key. Each entry decrements its ledger once.
+        if (target.ReceivedAbilitiesFromCards.TryGetValue("pinned", out var sources))
+            foreach (int source in sources.ToArray()) ChangePinnedLedger(target, source, -1);
+        target.PinnedTurns = 0;
+        _engine.FireSubAction("ZActionUnpinUnit", new[] { ActionValue2.Int("cardID", target.CardId) });
+        FirePinChanged(target, false);
+    }
+
+    private void ChangePinnedLedger(CardInstance target, int source, int delta)
+    {
+        var buff = GetOrCreateBuff(target, source, false);
+        buff.Pinned += delta;
+        if (buff.IsEmpty) RemoveBuffEntry(target, (source, false));
+    }
+
+    private void FirePinChanged(CardInstance target, bool pinned)
+    {
+        string trigger = pinned ? "OnOtherUnitPinned" : "OnOtherUnitUnpinned";
+        var recipients = CaptureRegisteredTriggerSnapshot(trigger);
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        var args = new object?[] { target };
+        var named = new Dictionary<string, object?> { [pinned ? "cardBeingPinned" : "card"] = target };
+        foreach (var observer in recipients)
         {
-            return;
+            TriggerTrace?.Add($"{trigger} → {observer.Name}#{observer.CardId}（eventCard={target.Name}#{target.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, trigger, target, eventArgs: args, namedArgs: named);
         }
-
-        GiveKeyword(target, Keyword.Pinned);
-
-        int turns = IsSideActive(target.Owner) ? 3 : 2;
-        target.PinnedTurns = Math.Max(target.PinnedTurns, turns);
-
-        FireTrigger("OnOtherUnitPinned", target, target.Owner,
-            eventArgs: new object?[] { target }, eventSubject: target,
-            namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-            {
-                ["cardBeingPinned"] = target,
-            });
     }
 
     /// <summary>
@@ -3096,34 +3819,42 @@ public sealed partial class CardApi
     /// </summary>
     public void ChangePinnedTurns(CardInstance target, int turnsToChange, int instigatorId)
     {
-        if (!target.Location.IsBoard() || target.IsHq || !IsUnit(target))
-        {
-            return;
-        }
+        if (!target.Location.IsBoard() || !IsUnit(target)) return;
 
-        target.PinnedTurns = Math.Clamp(target.PinnedTurns + turnsToChange, 0, 5);
+        target.PinnedTurns = Math.Clamp(unchecked(target.PinnedTurns + turnsToChange), 0, 5);
         _engine.FireSubAction("ZActionChangePinnedTurns", new[]
         {
-            ActionValue2.Int("turnsToChange", turnsToChange),
+            ActionValue2.Int("cardID", target.CardId),
             ActionValue2.Int("instigatorID", instigatorId),
+            ActionValue2.Int("turnsToChange", turnsToChange),
         });
     }
 
     /// <summary>
-    /// 「这张卡的能力集变了」—— 出处 `out/bp-cardfn.json` 函数
-    /// `ExecuteOnOtherCardsAbilitiesChanged`（i=307），签名 `BaseCardObject.h:643`：
+    /// 能力变化通知。权威 parsed BP_CardFunctions 的
+    /// ExecuteOnOtherCardsAbilitiesChanged i=38查询T29，i=307直接调用：
     /// <code>void OnOtherCardAbilitiesChanged(UBaseCardObject* cardChanging);</code>
     /// 只有广播这一种形态（没有"自己"那个变体）。
     /// 调用点（同一份 dump）：`ChangeHeavyArmor`、以及 Give/Remove 关键字一族。
     /// </summary>
-    public void FireAbilitiesChanged(CardInstance card)
-        => FireTrigger("OnOtherCardAbilitiesChanged", card, card.Owner,
-            eventArgs: new object?[] { card },
-            eventSubject: card,
-            namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-            {
-                ["cardChanging"] = card,
-            });
+    public void FireAbilitiesChanged(CardInstance? card)
+    {
+        // ExecuteOnOtherCardsAbilitiesChanged queries T29 once, then directly
+        // invokes every saved object. No subject exclusion, location check,
+        // suppression/registration recheck or stopFurtherActions gate.
+        const string trigger = "OnOtherCardAbilitiesChanged";
+        var recipients = CaptureRegisteredTriggerSnapshot(trigger);
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        var args = new object?[] { card };
+        var named = new Dictionary<string, object?> { ["cardChanging"] = card };
+        foreach (var observer in recipients)
+        {
+            if (library.FindProgram(observer.Name, trigger) is null) continue;
+            TriggerTrace?.Add($"{trigger} → {observer.Name}#{observer.CardId}（eventCard={card?.Name ?? "null"}#{card?.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, trigger, card, eventArgs: args, namedArgs: named);
+        }
+    }
 
     /// <summary>
     /// 「抑制」摘除的关键词集 —— 出处 `BP_CardFunctions::SuppressMultipleUnits`
@@ -3265,9 +3996,10 @@ public sealed partial class CardApi
     ///
     /// ## 内核的取舍（如实记录）
     /// <list type="bullet">
-    /// <item>`exileNation` / `effectType` / `range` 三个字段内核**没有建模** ⇒ 无法清零，
-    ///   它们参与的判定本来也不在（记为已知缺口）。</item>
-    /// <item>`isSalvaged`（1/1 收缴复制品）内核没建模 ⇒ 静态值一律取 `Definition` 卡面值。</item>
+    /// <item>`exileNation` / `range` 现在有实例字段：抑制分别清 0、回落到
+    ///   `StaticCardRef.range`。`range` 的唯一规则读取点是
+    ///   `cardsCheckFunctions.CanAttack` 的 `attackerCard.range &lt; 2`。</item>
+    /// <item>`isSalvaged` 的复制品按蓝图使用 1/1 静态基准。</item>
     /// <item>关于 `cantBeSuppressed` 守卫：蓝图**两条**都查（`IsLocatedOnBoard` +
     ///   `!HasCustomAbility(card,"cantBeSuppressed")`，IR 里 `cantBeSuppressed` 出现 9 次），
     ///   本轮补上（原先只查"在场 + 未被抑制"）⇒ `card_event_maginot_line` /
@@ -3324,7 +4056,7 @@ public sealed partial class CardApi
         target.SuppressStrippedKeywords ??= new List<string>();
         foreach (string keyword in SuppressStrips)
         {
-            if (target.Keywords.Contains(keyword))
+            if (target.HasKeyword(keyword))
             {
                 if (keyword == Keyword.Mobilize)
                 {
@@ -3344,17 +4076,44 @@ public sealed partial class CardApi
         //    现在算会把 `Keyword.HeavyArmor` 又挂回去。真正的重算在 ③ 之后统一做一次。
         target.HeavyArmorZeroedBySuppress = true;
 
-        // `TARGET` 的自定义能力（= 卡牌给单位添加的额外特效）也要失效。
-        // 蓝图走的是 L_0B93 那一遍 `receivedAbilitiesFromCards` 清洗
-        // （buffType=5 / changeType=7 customRemove），内核没有那张 giver 表，
-        // 只有 `CustomAbility` 这一个槽位 —— 摘掉并记下（解除时装回）。
-        if (target.CustomAbility is { Length: > 0 } ability)
+        // Suppression removes the five custom-effect keys; other keys retain
+        // foreign sources. Preserve the old snapshot for the legacy restore adapter.
+        if (target.ReceivedAbilitiesFromCards.Count > 0)
         {
-            target.SuppressStrippedCustomAbility = ability;
-            target.CustomAbility = null;
+            target.SuppressStrippedCustomAbility = target.CustomAbility;
+            target.SuppressStrippedAbilities = target.ReceivedAbilitiesFromCards.ToDictionary(
+                kv => kv.Key, kv => new List<int>(kv.Value), StringComparer.Ordinal);
+            // SuppressMultipleUnits i3231 selects these five ability keys;
+            // i4049 skips unresolved givers, i4368 removes their unsuffixed name.
+            foreach (var (key, sources) in target.SuppressStrippedAbilities)
+                if (key is "trigger" or "destruction" or "passive" or "lethal" or "custom")
+                    foreach (int source in sources)
+                        if (State.ById(source) is { } giver
+                            && target.BuffsBySource.TryGetValue((source, false), out var buff)
+                            && buff.CustomAbilityDetails.Contains(giver.Name))
+                        {
+                            var saved = new CardBuff { SourceCardId = source };
+                            saved.CustomAbilityDetails.Add(giver.Name);
+                            target.SuppressStrippedBuffs ??= new List<KeyValuePair<(int, bool), CardBuff>>();
+                            target.SuppressStrippedBuffs.Add(new KeyValuePair<(int, bool), CardBuff>((source, false), saved));
+                            RemoveCustomAbilityBuffDetail(target, source, giver.Name);
+                        }
+            // SuppressMultipleUnits i6383..7800 retains foreign sources for
+            // keys outside the five custom-effect categories. Source 0 and
+            // the suppressed card's own ID are removed; empty keys disappear.
+            foreach (var key in target.ReceivedAbilitiesFromCards.Keys.ToArray())
+            {
+                var sources = target.ReceivedAbilitiesFromCards[key];
+                if (key is "trigger" or "destruction" or "passive" or "lethal" or "custom") sources.Clear();
+                else sources.RemoveAll(id => id == 0 || id == target.CardId);
+                if (sources.Count == 0) target.ReceivedAbilitiesFromCards.Remove(key);
+            }
         }
 
-        // ---- ①b 解除 Pincer 关系（L_0803/L_083A）----
+        // ---- ①b exileNation = 0（L_07D9；在 Pincer 之前）----
+        target.ExileNation = 0;
+
+        // ---- ①c 解除 Pincer 关系（L_0803/L_083A）----
         // 必须先解除并派发 OnPincerEffectRemoved，再清空 customJson；否则伙伴卡
         // 仍会保留指向这张卡的 receiver/giver 记录。
         if (target.CustomJson.ContainsKey("pincer_receiver")
@@ -3363,29 +4122,29 @@ public sealed partial class CardApi
             RemovePincerEffects(target);
         }
 
-        // ---- ①c 清 customJson：只保留 `suppressionException`（L_0925-0B38）----
+        // ---- ①d 清 customJson：只保留 `suppressionException`（L_0925-0B38）----
         // `suppressionException` 是**卡自己的**恢复机制：抑制会洗掉整个 customJson，
         // 唯独把它原样写回，卡（如 `card_unit_gordon_highlanders`）才能在抑制后
         // 把自己保存的状态读回来。IR 里这个键出现 26 次。
         // `customName1/2` 也存在 customJson 里（见 `CardApiDispatch.SuffixAdd`），
         // 所以这一句同时完成了蓝图 L_0851/L_0886 的 `customName1/2 = None`。
         target.CustomJson.TryGetValue("suppressionException", out string? exception);
+        var exceptionType = exception is null ? CardJsonType.String : target.CustomJson.TypeOf("suppressionException");
         target.CustomJson.Clear();
         if (!string.IsNullOrEmpty(exception))
         {
-            target.CustomJson["suppressionException"] = exception;
+            target.CustomJson.Set("suppressionException", exception, exceptionType);
         }
 
-        // ---- ①d KreditsTax_AsEnemyTarget = 0（L_08BB）----
+        // ---- ①e KreditsTax_AsEnemyTarget = 0（L_08BB）----
         target.KreditsTaxAsEnemyTarget = 0;
 
         // ---- ② 老兵变回普通形态（L_12B3 `JSON_Clear(card,"veteran")`）----
-        // 内核的老兵是 `Keyword.Veteran`（`MakeVeteran` 只加这一个关键字，
-        // 见那边的注释：蓝图还会把 vet_card 的攻/防/行动费/关键字整套搬过来，
-        // 内核**没有** veteran 卡数据 ⇒ 那一半是既有缺口）。
-        // 直接删关键字 + 删 customJson 的 `veteran` 键（`Clear()` 已经把它清掉了），
-        // 与 `JSON_Clear` 一样**不发**任何子动作。
+        // Restore the ordinary raw bases as well as the veteran marker.
         target.Keywords.Remove(Keyword.Veteran);
+        target.VeteranOperationCost = null;
+        target.VeteranHeavyArmor = null;
+        target.EffectType = 0;
 
         // ---- ③ 所有增益失效：攻/防/重甲/行动费 buff 逐条摘走（记原文，供解除时装回）----
         // 玩家原话：「所有的增益效果也全部失效 —— 包括友方贴膜、敌方贴膜、
@@ -3410,8 +4169,9 @@ public sealed partial class CardApi
             buff.OperationCost = 0;
             if (buff.IsEmpty)
             {
-                target.BuffsBySource.Remove(key);
+                RemoveBuffEntry(target, key);
             }
+            else SynchronizeBuffTarget(target, key.SourceCardId);
         }
 
         // ---- ④ 数值回落到卡面静态值（L_136A / L_1441 / L_1504）----
@@ -3419,6 +4179,8 @@ public sealed partial class CardApi
         // Salvage copies; ordinary cards return to their card definition values.
         int staticAttack = target.IsSalvaged ? 1 : target.Definition.Attack;
         int staticDefense = target.IsSalvaged ? 1 : target.Definition.Defense;
+        // L_126C: range always comes from StaticCardRef.range, including Salvage.
+        target.ResetRange();
         target.Attack = staticAttack;                    // ChangeAttack(…, _staticAttack, Suppress)
 
         // 防御：**只在当前更高时压下来**（蓝图 `getTotalDefense > _staticDefense` 才改写）
@@ -3514,6 +4276,7 @@ public sealed partial class CardApi
                 live.Defense += saved.Defense;
                 live.HeavyArmor += saved.HeavyArmor;
                 live.OperationCost += saved.OperationCost;
+                live.CustomAbilityDetails.UnionWith(saved.CustomAbilityDetails);
                 if (saved.Duration > 0)
                 {
                     live.Duration = saved.Duration;
@@ -3532,69 +4295,173 @@ public sealed partial class CardApi
 
         if (card.SuppressStrippedCustomAbility is { Length: > 0 } ability)
         {
-            card.CustomAbility = ability;
+            if (card.SuppressStrippedAbilities is { } stripped)
+            {
+                foreach (var (name, givers) in stripped)
+                {
+                    if (!card.ReceivedAbilitiesFromCards.TryGetValue(name, out var active))
+                        card.ReceivedAbilitiesFromCards[name] = active = [];
+                    foreach (int giver in givers)
+                        if (!active.Contains(giver)) active.Add(giver);
+                }
+                card.SuppressStrippedAbilities = null;
+            }
+            else card.CustomAbility = ability;
             card.SuppressStrippedCustomAbility = null;
         }
     }
 
     /// <summary>
-    /// 让一张卡成为"老兵"（对应 `BP_CardFunctions::MakeVeteran`，81 条语句）。
-    ///
-    /// 蓝图控制流（UAssetCLI 的 **StatementIndex**；`out/bp-cardfn.json`）：
-    /// <code>
-    /// si=2427 JumpIfNot(card.isSuppressed) -> si=2806   ; 被压制 ⇒ 跳过整个广播段
-    /// si=2463 FetchAllCardsWithEventTrigger(32)         ; 32 = OnOtherCardBecomingVeteran
-    /// si=2736     item.OnOtherCardBecomingVeteran(card)
-    /// si=2842     Jump -> si=2463                       ; 循环回边
-    /// si=2782 ExecuteOnOtherCardsAbilitiesChanged(card) ; 能力集变了（同一段里，只一次）
-    /// si=2806 card.OnBecomingVeteran()                  ; ★ 自己：**压制与否都发**
-    /// </code>
-    /// 所以本内核的顺序是：广播（仅未被压制）→ 能力变化 → 自己。
-    ///
-    /// ⚠️ **没读懂的一处（不猜，照实说）**：si=2842 那条回边指向 si=2463（连订阅表都重取），
-    /// 而循环自增在 si=2847/2889 —— 两处读数在"什么条件下再跑一遍"上不自洽
-    /// （si=2672 的 `PushExecutionFlow(2847)` + si=2805 的 `PopExecutionFlow`
-    /// 也可能把流程直接送进出参段）。可观测的部分（广播一次 + 能力变化一次 + 自己一次）
-    /// 两种读法一致，所以按这一种实现。
+    /// BP MakeVeteran: require a living board card with an explicit upgrade,
+    /// apply the static template with veteranSet, then write raw ability flags.
+    /// The final event order is veteran observers, ability observers, subject.
     /// </summary>
     public void MakeVeteran(CardInstance target)
     {
-        if (target.Keywords.Add(Keyword.Veteran))
+        if (!IsLocatedOnBoard(target) || target.Defense <= 0 || target.Keywords.Contains(Keyword.Veteran)
+            || FindVeteranDefinition(State.Database, target) is not { } veteran)
         {
-            _engine.FireSubAction("ZActionMakeVeteran", new[]
-            {
-                ActionValue2.Int("cardID", target.CardId),
-            });
+            return;
+        }
 
-            // si=2427：被压制时**不广播** `OnOtherCardBecomingVeteran`（9 张订阅者）。
-            if (!target.Keywords.Contains(Keyword.Suppressed))
-            {
-                FireTrigger("OnOtherCardBecomingVeteran", target, target.Owner,
-                    eventArgs: new object?[] { target },
-                    eventSubject: target,
-                    namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-                    {
-                        ["card"] = target,
-                    });
-            }
+        bool giveAttackIfGainingFury = !target.HasFury && target.AttacksThisTurn < 2
+            && (target.HasAttackLeft || target.AttacksThisTurn == 1);
+        JsonSetBool(target, "veteran", true);
+        target.Keywords.Add(Keyword.Veteran);
 
-            // si=2782 ExecuteOnOtherCardsAbilitiesChanged(card)
-            FireAbilitiesChanged(target);
+        SetVeteranAttack(target, veteran.Attack, target.CardId);
+        SetVeteranDefense(target, veteran.Defense, target.CardId);
+        SetVeteranOperationCost(target, veteran.OperationCost, target.CardId);
+        SetVeteranHeavyArmor(target, veteran.HeavyArmor, target.CardId);
 
-            FireTrigger("OnBecomingVeteran", target, target.Owner);
+        int attackLeft = target.RemainingAttacks;
+        foreach (string keyword in new[] { Keyword.Ambush, Keyword.Blitz, Keyword.Fury,
+            Keyword.Mobilize, Keyword.Shock, Keyword.Destruction, Keyword.Smokescreen })
+        {
+            if (veteran.Keywords.Contains(keyword)) target.Keywords.Add(keyword);
+            else target.Keywords.Remove(keyword);
+        }
+        target.EffectType = veteran.EffectType;
+        // Raw hasFury writes do not themselves write native attackLeft.
+        target.SetRemainingAttacks(attackLeft + (giveAttackIfGainingFury
+            && veteran.Keywords.Contains(Keyword.Fury) ? 1 : 0));
+
+        bool guard = veteran.Keywords.Contains(Keyword.Guard);
+        if (!HasCustomAbility(target, "guard") && target.Keywords.Contains(Keyword.Guard) != guard)
+        {
+            if (guard) target.Keywords.Add(Keyword.Guard);
+            else target.Keywords.Remove(Keyword.Guard);
+            if (guard) RemoveSmokescreen(target, skipAction: true);
+            UpdateGuarded(target.Location);
+        }
+
+        _engine.FireSubAction("ZActionMakeVeteran", new[] { ActionValue2.Int("cardID", target.CardId) });
+        if (!target.IsSuppressed)
+        {
+            FireTrigger("OnOtherCardBecomingVeteran", target, target.Owner,
+                eventArgs: new object?[] { target }, eventSubject: target,
+                namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal) { ["card"] = target });
+        }
+        FireAbilitiesChanged(target);
+        FireTrigger("OnBecomingVeteran", target, target.Owner);
+    }
+
+    // ChangeBuffsFromCards(veteranSet) removes permBuff/SetValue for the selected
+    // stat across all sources. Other stats, combat abilities and tempBuffGive survive.
+    private void ClearVeteranStatBuffs(CardInstance target, Action<CardBuff> clearStat)
+    {
+        foreach (var key in target.BuffsBySource.Keys.Where(key => !key.Temporary).ToArray())
+        {
+            var buff = target.BuffsBySource[key];
+            clearStat(buff);
+            if (buff.IsEmpty) RemoveBuffEntry(target, key);
+            else SynchronizeBuffTarget(target, key.SourceCardId);
         }
     }
 
-    public void CustomAbilityAdd(CardInstance target, string ability, CardInstance? giver)
+    private void SetVeteranAttack(CardInstance target, int amount, int instigatorId)
     {
-        target.CustomAbility = ability;
-        _engine.FireSubAction("ZActionCustomAbilityAdd", new[]
+        if (instigatorId <= 0 || !CanCardBeBuffed(target)) return;
+        int before = target.Attack;
+        int temporary = target.BuffsBySource.Where(kv => kv.Key.Temporary).Sum(kv => kv.Value.Attack);
+        ClearVeteranStatBuffs(target, static buff => buff.Attack = 0);
+        target.Attack = Math.Max(0, Math.Clamp(amount, 0, 99) + temporary);
+        if (before - temporary != amount) NotifyAttackChanged(target, target.Attack - before, instigatorId);
+    }
+
+    private void SetVeteranDefense(CardInstance target, int amount, int instigatorId)
+    {
+        if (instigatorId <= 0 || target.Defense <= 0 || !CanCardBeBuffed(target)) return;
+        ClearVeteranStatBuffs(target, static buff => buff.Defense = 0);
+        target.Defense = target.MaxDefense = Math.Clamp(amount, 0, 99);
+        _engine.FireSubAction("ZActionGainDefense", new[] {
+            ActionValue2.Int("instigatorID", instigatorId), ActionValue2.Int("gained", amount),
+            ActionValue2.Int("newDefenseValue", target.Defense) });
+        // Only changeType=2 dispatches OnAfterDefenseIsSet; veteranSet is 5.
+        if (target.Defense == 0) _engine.Destroy(target, State.ById(instigatorId));
+    }
+
+    private void SetVeteranOperationCost(CardInstance target, int amount, int instigatorId)
+    {
+        if (instigatorId <= 0 || IsUnrevealedCovertCard(target)) return;
+        var permanent = target.BuffsBySource.Where(kv => !kv.Key.Temporary).Select(kv => kv.Value).ToArray();
+        var absolute = permanent.LastOrDefault(buff => buff.OperationCostSetsAbsoluteValue);
+        int before = (absolute is null ? target.VeteranOperationCost ?? target.Definition.OperationCost
+            : target.Definition.OperationCost + absolute.OperationCost)
+            + permanent.Where(buff => !buff.OperationCostSetsAbsoluteValue).Sum(buff => buff.OperationCost);
+        ClearVeteranStatBuffs(target, static buff => {
+            buff.OperationCost = 0; buff.OperationCostSetsAbsoluteValue = false; });
+        target.VeteranOperationCost = Math.Clamp(amount, 0, 99);
+        target.RecalculateStats();
+        if (before == amount) return;
+        _engine.FireSubAction("ZActionChangeOperationCost", new[] {
+            ActionValue2.Int("instigatorID", instigatorId), ActionValue2.Int("amount", amount) });
+        FireOperationCostChanged(target, instigatorId, runResetEvents: true);
+    }
+
+    private void SetVeteranHeavyArmor(CardInstance target, int amount, int instigatorId)
+    {
+        if (instigatorId <= 0 || IsUnrevealedCovertCard(target)) return;
+        int before = (target.HeavyArmorZeroedBySuppress ? 0 : target.VeteranHeavyArmor ?? target.Definition.HeavyArmor)
+            + target.BuffsBySource.Where(kv => !kv.Key.Temporary).Sum(kv => kv.Value.HeavyArmor);
+        ClearVeteranStatBuffs(target, static buff => buff.HeavyArmor = 0);
+        target.VeteranHeavyArmor = Math.Clamp(amount, 0, 3);
+        target.HeavyArmorZeroedBySuppress = false;
+        target.RecalculateStats();
+        if (before == amount) return;
+        _engine.FireSubAction("ZActionAddHeavyArmor", new[] {
+            ActionValue2.Int("cardID", target.CardId), ActionValue2.Int("instigatorID", instigatorId),
+            ActionValue2.Int("amount", amount) });
+        FireAbilitiesChanged(target);
+    }
+
+    public bool CustomAbilityAdd(CardInstance target, string ability, CardInstance? giver)
+        => CustomAbilityAdd(target, ability, giver?.CardId ?? 0);
+
+    // Source-map, type-5 custom-buff entries and notifications. Removal also
+    // preserves the raw destruction flag while updating its type-6 ledger.
+    public bool CustomAbilityAdd(CardInstance target, string ability, int giverId, bool skipSubActions = false,
+        bool skipBuffTexts = false, bool skipAddToBattlelog = false)
+    {
+        if (!CanCardBeBuffed(target)) return false;
+        if (!target.ReceivedAbilitiesFromCards.TryGetValue(ability, out var givers))
+            target.ReceivedAbilitiesFromCards[ability] = givers = [];
+        if (givers.Contains(giverId)) return false;
+        int left = target.RemainingAttacks;
+        if (!skipBuffTexts) GetOrCreateBuff(target, giverId, false).CustomAbilityDetails.Add(CustomAbilityNameDetail(target, giverId));
+        givers.Add(giverId);
+        // Raw source-map mutations do not write native attackLeft.
+        target.SetRemainingAttacks(left);
+        if (!skipSubActions) _engine.FireSubAction("ZActionCustomAbilityAdd", new[]
         {
-            ActionValue2.Int("giverID", giver?.CardId ?? 0),
+            ActionValue2.Int("cardID", target.CardId),
+            ActionValue2.Int("giverID", giverId),
             ActionValue2.Str("ability", ability),
+            ActionValue2.Bool("skipText", skipBuffTexts),
+            ActionValue2.Bool("skipAddToBattlelog", skipAddToBattlelog),
         });
 
-        FireAbilitiesChanged(target);
+        return true;
     }
 
     /// <summary>
@@ -3602,7 +4469,7 @@ public sealed partial class CardApi
     ///
     /// 出处：`out/bp-cardfn.json` 函数 `ResetCardInBattle`：
     /// <code>
-    /// i=749  cardToChange.ResetCardAttributes()      ; 原生函数，实现体不在客户端
+    /// i=749  cardToChange.ResetCardAttributes()      ; 当前 EXE 已验证实现 RVA 0x4b09020
     /// i=782  IsActionProcess()
     /// i=815  cardToChange.OnCardReset()              ; ★ 自己（64 张订阅）
     /// i=851  FetchAllCardsWithEventTrigger(53)       ; 53 = OnOtherCardReset（39 张订阅）
@@ -3611,28 +4478,124 @@ public sealed partial class CardApi
     /// 触发号 53 的依据：`ERegisteredCardFunction.h` 逐项数下来第 54 项 = `OnOtherCardReset`。
     /// 签名 `BaseCardObject.h:718/565`。
     ///
-    /// ⚠️ **触发点只有两处**（全 dump 搜 `ResetCardInBattle` 只有这两个调用方）：
+    /// 蓝图包装器的两个调用方：
     /// `MoveCardFromBoardToOwnersHand` i=626 与 `MoveCardToTopOfDeck` i=828 ——
-    /// 也就是「**卡从场上回手 / 回牌库**」。
-    /// `ResetCardAttributes` 是原生函数、实现体不在客户端 dump 里，
-    /// 所以"它还重置了什么"**读不出来**；这里只落实两个可证的触发点，不猜别的时机。
+    /// MoveCardToTopOfDeck 查的是全对局卡对象映射，手牌回牌库同样重置。
+    /// 原生实现的字段写入与五个 JSON 键删除见 out/audit/live-reset-native-implementation.txt。
     /// </summary>
     public void ResetCardInBattle(CardInstance card)
     {
-        FireTrigger("OnCardReset", card, card.Owner);
-
-        FireTrigger("OnOtherCardReset", card, card.Owner,
-            eventArgs: new object?[] { card, card.CardId },
-            eventSubject: card,
-            namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-            {
-                ["cardReset"] = card,
-                ["resetCardID"] = card.CardId,
-            });
+        // Reset prelude removes this ID from current source objects before own events.
+        foreach (int sourceId in card.BuffsBySource.Keys.Select(k => k.SourceCardId).Distinct().ToArray())
+            if (sourceId > 0 && State.ById(sourceId) is { } source)
+                source.CardsBuffedByThisCard.RemoveAll(id => id == card.CardId);
+        card.ResetAttributes();
+        if (card.OriginalOwner is Side.Left or Side.Right)
+        {
+            // Native ResetCardAttributes restores side directly (+0x277 -> +0x276);
+            // it does not run location rearrangement for other cards.
+            State.ChangeOwner(card, card.OriginalOwner, normalize: false);
+        }
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is null) return;
+        // i=815 is a direct call: no registration, location or suppression gate.
+        const string own = "OnCardReset";
+        if (library.FindProgram(card.Name, own) is not null)
+        {
+            TriggerTrace?.Add($"{own} → {card.Name}#{card.CardId}（eventCard={card.Name}#{card.CardId}）");
+            RunTriggerProgram(library, card, card.Name, own, card);
+        }
+        // i=851 queries AFTER the own hook. i=1120 invokes the captured objects
+        // without a subject exclusion, stop gate or per-item eligibility recheck.
+        const string other = "OnOtherCardReset";
+        var recipients = CaptureRegisteredTriggerSnapshot(other);
+        foreach (var observer in recipients)
+        {
+            if (library.FindProgram(observer.Name, other) is null) continue;
+            TriggerTrace?.Add($"{other} → {observer.Name}#{observer.CardId}（eventCard={card.Name}#{card.CardId}）");
+            RunTriggerProgram(library, observer, observer.Name, other, card,
+                eventArgs: new object?[] { card, card.CardId },
+                namedArgs: new Dictionary<string, object?> { ["cardReset"] = card, ["resetCardID"] = card.CardId });
+        }
     }
 
     public bool HasCustomAbility(CardInstance card, string? ability = null)
-        => card.CustomAbility is not null && (ability is null || card.CustomAbility == ability);
+        => ability is null ? card.ReceivedAbilitiesFromCards.Count > 0
+            : card.ReceivedAbilitiesFromCards.TryGetValue(ability, out var sources) && sources.Count > 0;
+
+    // Native attack predicates first query customName1, then the exact source-map key.
+    public bool HasCantAttack(CardInstance card)
+        => HasAttackRestriction(card, "cantAttack");
+
+    public bool HasCantAttackType(CardInstance card, string cardType)
+        => HasAttackRestriction(card, "cantAttack:" + cardType);
+
+    public bool HasCantBeAttackedBy(CardInstance card, string unitType)
+        => HasAttackRestriction(card, "cantBeAttackedBy:" + unitType);
+
+    private bool HasAttackRestriction(CardInstance card, string attribute)
+        => CustomNameHasAttribute(card, "customName1", attribute) || HasCustomAbility(card, attribute);
+
+    public bool HasCustomAbilityFromCard(CardInstance card, string ability, int giverId)
+        => card.ReceivedAbilitiesFromCards.TryGetValue(ability, out var givers) && givers.Contains(giverId);
+
+    public bool CustomAbilityRemove(CardInstance target, string ability, int giverId, bool removeAllGivers)
+    {
+        // i99..215 runs before the map lookup and every map-based early exit.
+        // This changes only the combat ledger, never the raw hasDestruction flag.
+        if (ability == "destruction" && target.Keywords.Contains(Keyword.Destruction))
+        {
+            var key = (giverId, false);
+            var buff = GetOrCreateBuff(target, giverId, false);
+            buff.Destruction--;
+            if (buff.IsEmpty) RemoveBuffEntry(target, key);
+        }
+        bool changed = false;
+        if (target.ReceivedAbilitiesFromCards.TryGetValue(ability, out var givers))
+        {
+            int left = target.RemainingAttacks;
+            string detail = CustomAbilityNameDetail(target, giverId);
+            if (removeAllGivers)
+            {
+                if (givers.Count > 0 && detail.Length > 0)
+                    foreach (int source in givers)
+                    {
+                        // Destruction alone recomputes each source's unsuffixed
+                        // name. Other abilities reuse the caller giver's detail.
+                        if (ability == "destruction") detail = State.ById(source)?.Name ?? "";
+                        RemoveCustomAbilityBuffDetail(target, source, detail);
+                    }
+            }
+            else if (detail.Length > 0) RemoveCustomAbilityBuffDetail(target, giverId, detail);
+            if (!removeAllGivers && givers.RemoveAll(source => source == giverId) == 0) return false;
+            if (removeAllGivers || givers.Count == 0) target.ReceivedAbilitiesFromCards.Remove(ability);
+            target.SetRemainingAttacks(left);
+            changed = true;
+        }
+        // BP i1839 also notifies when the ability key was absent. An unknown
+        // source in an existing list instead returns at i2174 without notifying.
+        _engine.FireSubAction("ZActionCustomAbilityRemove", new[] {
+            ActionValue2.Int("cardID", target.CardId), ActionValue2.Int("giverID", giverId),
+            ActionValue2.Str("ability", ability), ActionValue2.Bool("RemoveAllGivers", removeAllGivers) });
+        return changed; // Internal mutation result, not Blueprint's qqq output.
+    }
+
+    private string CustomAbilityNameDetail(CardInstance target, int giverId)
+    {
+        var giver = State.ById(giverId);
+        if (giver is null) return "";
+        return giver.Name + (giver.CardId == target.CardId && giver.Definition.ChooseOneOptionCount != 0
+            ? "_" + giver.ChooseOne.ToString(System.Globalization.CultureInfo.InvariantCulture) : "");
+    }
+
+    private void RemoveCustomAbilityBuffDetail(CardInstance target, int sourceId, string detail)
+    {
+        var key = (sourceId, false);
+        if (!target.BuffsBySource.TryGetValue(key, out var buff)) return;
+        buff.CustomAbilityDetails.Remove(detail);
+        if (buff.IsEmpty) RemoveBuffEntry(target, key);
+        else SynchronizeBuffTarget(target, sourceId);
+    }
 
     /// <summary>
     /// `card_event_sniped::DeactivateOtherSniped` marks the other Sniped
@@ -3747,27 +4710,48 @@ public sealed partial class CardApi
     /// <summary>对应 PersistCustomFields —— 游戏用它把卡上的临时状态写进子动作。</summary>
     public void PersistCustomFields(CardInstance card)
     {
+        // Native customName members and gameplay tags share our local backing store,
+        // but are not members of the client's BlueprintJson object.
+        var fields = new Dictionary<string, object?>(StringComparer.Ordinal);
+        foreach (var pair in card.CustomJson)
+        {
+            if (pair.Key is "customName1" or "customName2" || pair.Key == DynamicGameplayTagsKey) continue;
+            fields[pair.Key] = card.CustomJson.TypeOf(pair.Key) switch
+            {
+                CardJsonType.Number => double.Parse(pair.Value, System.Globalization.CultureInfo.InvariantCulture),
+                CardJsonType.Boolean => pair.Value == "1",
+                CardJsonType.IntArray => JsonGetIntArray(card, pair.Key),
+                _ => pair.Value,
+            };
+        }
+        string json = System.Text.Json.JsonSerializer.Serialize(fields, new System.Text.Json.JsonSerializerOptions
+        {
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        });
+        // AddSubActionPersistCustomFields replaces every quote after JSON encoding.
         _engine.FireSubAction("ZActionPersistCustomFields", new[]
         {
             ActionValue2.Int("cardID", card.CardId),
-            ActionValue2.Str("customJson", string.Join(";", card.CustomJson.Select(kv => $"{kv.Key}={kv.Value}"))),
+            ActionValue2.Str("customName1", CardCustomNames.Text(card, "customName1")),
+            ActionValue2.Str("customName2", CardCustomNames.Text(card, "customName2")),
+            ActionValue2.Str("customJson", json.Replace("\"", "\\\"", StringComparison.Ordinal)),
         });
     }
 
     // ---- 卡牌私有 JSON（JSON_* 一族，被 19~21 套牌需要）----
 
     public int JsonGetInt(CardInstance card, string key)
-        => card.CustomJson.TryGetValue(key, out string? v) && int.TryParse(v, out int i) ? i : 0;
+        => card.CustomJson.HasType(key, CardJsonType.Number) && card.CustomJson.TryGetValue(key, out string? v) && int.TryParse(v, out int i) ? i : 0;
 
-    public void JsonSetInt(CardInstance card, string key, int value) => card.CustomJson[key] = value.ToString();
+    public void JsonSetInt(CardInstance card, string key, int value) => card.CustomJson.Set(key, value.ToString(System.Globalization.CultureInfo.InvariantCulture), CardJsonType.Number);
 
     public bool JsonGetBool(CardInstance card, string key)
-        => card.CustomJson.TryGetValue(key, out string? v) && v == "1";
+        => card.CustomJson.HasType(key, CardJsonType.Boolean) && card.CustomJson.TryGetValue(key, out string? v) && v == "1";
 
-    public void JsonSetBool(CardInstance card, string key, bool value) => card.CustomJson[key] = value ? "1" : "0";
+    public void JsonSetBool(CardInstance card, string key, bool value) => card.CustomJson.Set(key, value ? "1" : "0", CardJsonType.Boolean);
 
     public string JsonGetString(CardInstance card, string key)
-        => card.CustomJson.GetValueOrDefault(key, "");
+        => card.CustomJson.HasType(key, CardJsonType.String) ? card.CustomJson.GetValueOrDefault(key, "") : "";
 
     public void JsonSetString(CardInstance card, string key, string value) => card.CustomJson[key] = value;
 
@@ -3798,7 +4782,7 @@ public sealed partial class CardApi
 
     public List<int> JsonGetIntArray(CardInstance card, string key)
     {
-        if (!card.CustomJson.TryGetValue(key, out string? raw) || raw.Length == 0)
+        if (!card.CustomJson.HasType(key, CardJsonType.IntArray) || !card.CustomJson.TryGetValue(key, out string? raw) || raw.Length == 0)
         {
             return new List<int>();
         }
@@ -3816,7 +4800,7 @@ public sealed partial class CardApi
     }
 
     public void JsonSetIntArray(CardInstance card, string key, IReadOnlyList<int> values)
-        => card.CustomJson[key] = string.Join(JsonListSeparator, values);
+        => card.CustomJson.Set(key, string.Join(JsonListSeparator, values), CardJsonType.IntArray);
 
     public void JsonAddToIntArray(CardInstance card, string key, int value)
     {
@@ -3949,7 +4933,7 @@ public sealed partial class CardApi
     /// </summary>
     public bool JsonRemoveFromIntArray(CardInstance card, string key, int value)
     {
-        if (!card.CustomJson.ContainsKey(key))
+        if (!card.CustomJson.HasType(key, CardJsonType.IntArray))
         {
             return false;
         }
@@ -3967,7 +4951,7 @@ public sealed partial class CardApi
     }
 
     /// <summary>把 VM 传来的值当作卡牌数组。</summary>
-    internal static List<CardInstance> EvalArray(object? receiver, object?[] args)
+    internal List<CardInstance> EvalArray(object? receiver, object?[] args)
     {
         if (receiver is List<CardInstance> rl)
         {
@@ -3980,6 +4964,10 @@ public sealed partial class CardApi
             {
                 return list;
             }
+            if (v is System.Collections.IList values)
+                return values.Cast<object?>().Select(value => value as CardInstance
+                    ?? (value is int id ? State.ById(id) : null))
+                    .Where(card => card is not null).Select(card => card!).ToList();
         }
 
         if (receiver is CardInstance single)
@@ -4124,8 +5112,8 @@ public sealed partial class CardApi
     /// ★★ **顺序必须是「进入战斗的顺序」**（2026-10-02 从蓝图定案）。
     /// 客户端遍历场上一律走 `GetAllCardInBattle()` = `Map_Values(AllCardsInBattle)`
     ///（`_deps/BP_GameState_Battle.g.cs:1571`），而那个映射**只增不删**
-    ///（全树 0 处 `Map_Remove`，见 `AddCardToAllCardsInBattle` `:301-319`）
-    /// ⇒ 顺序 = **插入顺序**。详见 <see cref="GameState.BoardInBattleOrder"/>。
+    ///（当前完整蓝图导出未发现单卡Map_Remove），这里采用全局登记顺序，
+    /// 换主不重排。更广泛的TMap行为边界见 <see cref="GameState.BoardInBattleOrder"/>。
     ///
     /// ⚠️ 以前这里用的是 `State.Board(s)`（按 `LocationNumber` 排序）——
     /// 同一次消费、同一个下标会**取到不同的卡**，这正是「随机效果与客户端不一致」
@@ -4136,6 +5124,17 @@ public sealed partial class CardApi
     /// Blueprint `GetHighestBomberAttack`：在指定一方当前场面中筛选轰炸机，
     /// 并返回其实时总攻击力的最大值；没有轰炸机时返回 0。
     /// </summary>
+    public int GetUnitTypeCountOnBoard(Side side)
+    {
+        var types = new HashSet<int>();
+        foreach (var card in State.BattleCardsInOrder(side).Where(c => c.Defense > 0 && IsUnit(c) && !IsUnrevealedCovertCard(c)))
+        {
+            types.Add(card.Definition.TypeId);
+            if (IsTank(card)) types.Add(3);
+        }
+        return types.Count;
+    }
+
     public int GetHighestBomberAttack(Side side)
         => GetCardsOnBoardBySide(side)
             .Where(MatchEngine.IsBomber)
@@ -4143,19 +5142,24 @@ public sealed partial class CardApi
             .DefaultIfEmpty(0)
             .Max();
 
-    public IEnumerable<CardInstance> GetAllUnitsOnBoard() => State.Board(Side.Left).Concat(State.Board(Side.Right));
-    public IEnumerable<CardInstance> GetAllCardsOnBoard() => GetAllUnitsOnBoard().Concat(new[] { State.Hq(Side.Left), State.Hq(Side.Right) });
-    /// <summary>
-    /// Blueprint `GetAllCardsInFrontline`: return every card currently in the
-    /// shared frontline, regardless of owner. Covert visibility is not modeled,
-    /// so the only effective filter is the location.
-    /// </summary>
-    public IEnumerable<CardInstance> GetAllCardsInFrontline()
-        => State.BattleCardsInOrder(Side.Left)
-            .Concat(State.BattleCardsInOrder(Side.Right))
-            .Where(card => card.Location == CardLocation.BoardFrontline);
-    public IEnumerable<CardInstance> GetAllCards() => State.AllCards;
-    public IEnumerable<CardInstance> GetCardsInHandBySide(Side s) => State.Hand(s);
+    public IEnumerable<CardInstance> GetAllUnitsOnBoard(bool includeCovert = false)
+        => State.AllCardsInBattleOrder.Where(card => card.Location.IsBoard() && IsUnit(card)
+            && card.Defense > 0 && (includeCovert || !IsUnrevealedCovertCard(card)));
+
+    // Unlike GetAllUnitsOnBoard, the native all-card/frontline queries do not
+    // require positive defense or a unit type. Preserve the global map order.
+    public IEnumerable<CardInstance> GetAllCardsOnBoard(bool includeCovert = false)
+        => State.AllCardsInBattleOrder.Where(card => card.Location.IsBoard()
+            && (includeCovert || !IsUnrevealedCovertCard(card)));
+
+    public IEnumerable<CardInstance> GetAllCardsInFrontline(bool includeCovert = false)
+        => State.AllCardsInBattleOrder.Where(card => card.Location == CardLocation.BoardFrontline
+            && (includeCovert || !IsUnrevealedCovertCard(card)));
+    public IEnumerable<CardInstance> GetAllCards() => State.AllCardsInBattleOrder;
+    // Current pak GetCardsInHandBySide scans global registration order,
+    // checks Owner and either hand location, and excludes forecast/weather cards.
+    public IEnumerable<CardInstance> GetCardsInHandBySide(Side s)
+        => State.AllCardsInBattleOrder.Where(card => card.Owner == s && IsLocatedInHand(card) && !IsForecastCard(card)).ToArray();
     /// <summary>
     /// 「某一方牌库里的**卡 ID**」。蓝图链条：
     /// `BP_CardFunctions.GetDeckByside`（薄包装，反编译原文
@@ -4210,30 +5214,46 @@ public sealed partial class CardApi
     public int GetTotalAttack(Side s) => State.Board(s).Sum(u => u.Attack);
     public int GetTotalDefense(Side s) => State.Board(s).Sum(u => u.Defense);
 
-    public CardInstance? GetRandomCard(IReadOnlyList<CardInstance> pool)
+    /// <summary>BP_CardFunctions helper: count draw, dummy draws, requested draw.</summary>
+    public int RandomIntFromRangeWithStream(int minimum, int maximum)
+    {
+        int emptyConsume = State.Random.RandRange(1, 10);
+        for (int i = 0; i < emptyConsume; i++) State.Random.RandRange(0, 1);
+        return State.Random.RandRange(minimum, maximum);
+    }
+
+    public CardInstance? GetRandomCard(IReadOnlyList<CardInstance> pool, bool skipCustomAlways = false)
     {
         if (pool.Count == 0)
         {
             return null;
         }
 
-        // `GetRandomCard(cards, skipCustomAlways, out randomCard)` 在蓝图里是
-        // `RandomIntegerInRangeFromStream(cardsRandomStream, 0, Length-1)`
-        // （`ref/kards-sim/KardsSim/Generated/BP_CardFunctions.g.cs:21682-21698`）——
-        // 一次消费、闭区间。游标探针记下候选集大小与选中下标，用来和客户端对账。
+        // Authoritative BP_CardFunctions:GetRandomCard i=112/363..981:
+        // scan the supplied array in order; Array_Add preserves duplicate entries.
+        // This helper adds no owner, zone, suppression, or defense filter.
+        IReadOnlyList<CardInstance> selectionPool = pool;
+        if (!skipCustomAlways)
+        {
+            var priority = pool.Where(card => CardCustomNames.Has(card, "customName1", "AlwaysSelectedAsRandom")).ToList();
+            if (priority.Count > 0) selectionPool = priority;
+        }
+
+        // BP helper i=227/1096 calls the padded Blueprint stream helper,
+        // not a single raw FRandomStream draw (RULE-104).
         uint seedBefore = State.Random.Seed;
         long cursorBefore = State.Random.ConsumedCount;
-        int index = State.Random.Next(pool.Count);
-        CardInstance picked = pool[index];
-        // 候选集的**内容与顺序**也要记 —— 同一次消费、同一个下标，
+        int index = RandomIntFromRangeWithStream(0, selectionPool.Count - 1);
+        CardInstance picked = selectionPool[index];
+        // 候选集的**内容与顺序**也要记 —— 相同的最终随机下标，
         // 候选集排列不同就会取到不同的卡（这是"随机效果与客户端不一致"的第三个成因）。
         //
         // 仅诊断开启时构造完整候选表，避免正常自对弈路径上的字符串分配。
         if (State.CollectRandomTrace)
         {
             // Full order is required to distinguish a pool mismatch from an RNG mismatch.
-            string poolDump = string.Join(",", pool.Select(x => x.Name));
-            State.TraceRandom($"GetRandomCard n={pool.Count} idx={index} -> {picked.Name} " +
+            string poolDump = string.Join(",", selectionPool.Select(x => x.Name));
+            State.TraceRandom($"GetRandomCard n={selectionPool.Count} inputN={pool.Count} skipCustomAlways={skipCustomAlways} idx={index} -> {picked.Name} " +
                 $"cursor={cursorBefore}->{State.Random.ConsumedCount} " +
                 $"seed={seedBefore}->{State.Random.Seed} 池=[{poolDump}]");
         }
@@ -4288,35 +5308,28 @@ public sealed partial class CardApi
     /// <summary>
     /// `ShouldGotchaTrigger(out shouldIt)` —— **这张卡自己**现在该不该响应反制触发。
     ///
-    /// ## ★ 判据落在 **self**，不是实参
-    ///
-    /// 蓝图调用点（`Generated/Britain/Base/events/card_event_interception.g.cs:53`）：
-    /// <code>
-    /// H.Call("ShouldGotchaTrigger", new Val[] { self, K2Node_Event_cardPlayed, Val.Out(…) })
-    /// </code>
-    /// 而 `IR` 里的形状（`docs/card-ir.json`，53 个调用点**全部**如此）是
-    /// <c>args = [触发卡, out]</c>、**没有 `recv`** —— 也就是**隐式 self**
-    /// （<c>KismetVm.Eval</c> 的 `{self:true}` → `ctx.Self`）。
-    /// ⇒ 判据必须落在 <c>ctx.Self</c>（= 正在跑这段程序的那张卡），
-    /// **实参 `a[0]` 是"触发这件事的那张卡"，与判据无关**。
-    ///
-    /// 把 `a[0]` 当 self 的后果：整族反制卡的 `ShouldGotchaTrigger` 会去问
-    /// 「刚被打出的那张牌是不是反制卡」—— 那是**普通卡**，恒假 ⇒ 53 个调用点
-    /// 全部静默失效。
-    ///
-    /// ## 参考实现（唯一可读的第二个口径）
-    ///
-    /// `ref/kards-sim/KardsSim/Bridge/EngineHost.cs:1348-1355`：
-    /// <code>
-    /// var self = h.Card_(a[0]);            // a[0] 在它那边就是 self（g.cs 的实参表）
-    /// should = self.Covert &amp;&amp; !self.Destroyed &amp;&amp; gotcha
-    /// </code>
-    /// 去掉那两个恒假项之后，剩下的可核实语义是 **「未被销毁」** ——
-    /// 内核里对应 <see cref="CardInstance.IsAlive"/>（`!= Discard &amp;&amp; != NotAvailable`）。
+    /// 当前客户端 exec RVA 0x4a85b20 调用实现 RVA 0x4b0ddd0。
+    /// 接收者必须已装填、位于手牌、当前为另一方行动；触发卡若未揭示
+    /// 且有 Covert，接收者需要 customName1 的 canTargetCovert 标记。
+    /// sideeffect.blockgotcha 和任意战斗卡 JSON 中存在的 stop_gotcha
+    /// 字段都会阻止触发。stop_gotcha 判字段存在性，不读取布尔值。
+    /// 字段偏移由当前 UE4SS SDK 对应；辅助事件名称由只读 FName 采集确认。
     /// </summary>
-    public bool ShouldGotchaTrigger(CardInstance? self)
-        => self is not null && IsGotcha(self) && self.IsAlive
-           && !State.HasGameplaySideEffect(self.Owner, "sideeffect.blockgotcha");
+    public bool ShouldGotchaTrigger(CardInstance? self, CardInstance? triggerCard = null)
+    {
+        // Current client: exec RVA 0x4a85b20 -> implementation 0x4b0ddd0.
+        // The argument is the triggering card; the receiver is the countermeasure.
+        if (self is null) return false;
+        if (triggerCard is not null && IsUnrevealedCovertCard(triggerCard)
+            && !CustomNameHasAttribute(self, "customName1", "canTargetCovert")) return false;
+        if (self.GotchaActivated <= 0 || State.ActiveSide == self.Owner
+            || self.Location is not (CardLocation.HandLeft or CardLocation.HandRight)) return false;
+        if (State.HasGameplaySideEffect(self.Owner, "sideeffect.blockgotcha")) return false;
+
+        // Native JSON helper 0x4518400 -> 0x4518310 checks field presence,
+        // not its boolean value. GetAllCards includes every location.
+        return !State.AllCards.Any(card => card.CustomJson.ContainsKey("stop_gotcha"));
+    }
 
     /// <summary>
     /// `GetHandLocationBySide(side, out handLocation)`
@@ -4330,6 +5343,18 @@ public sealed partial class CardApi
     /// </summary>
     public CardLocation GetHandLocationBySide(Side side)
         => side == Side.Left ? CardLocation.HandLeft : CardLocation.HandRight;
+
+    // RefreshLocationStatus snapshots its affected set, compacts 3..7, then
+    // updates the board cache immediately for each physical location.
+    public void RefreshLocationStatus(IEnumerable<CardLocation> affectedLocations)
+    {
+        foreach (var location in affectedLocations.Distinct().ToArray())
+        {
+            if ((int)location is < 3 or > 7) continue;
+            RearrangeLocation(location);
+            if (location.IsBoard()) UpdateGuarded(location);
+        }
+    }
 
     /// <summary>
     /// `RearrangeLocation(location)`（`BP_CardFunctions.g.cs:29227-29300`）：
@@ -4350,13 +5375,12 @@ public sealed partial class CardApi
     /// 这里按蓝图实现，调用方（`GotchaTriggered`）传的正是手牌位置。
     ///
     /// 排序稳定性：蓝图是插入排序（`>` 比较）⇒ 同值时保持**输入数组顺序**
-    /// （= `AllCardsInBattle` 的插入序）。内核用 `State.AllCards`（按 `CardId` 升序）
-    /// 作为输入，LINQ `OrderBy` 也是稳定排序 ⇒ 同值时按 `CardId`。
-    /// 这是**近似**（内核没有 `AllCardsInBattle` 那张只增不删的映射），已标注。
+    /// （= 没有删除或插槽复用时 `AllCardsInBattle` 的入表顺序）。
+    /// LINQ OrderBy 的稳定排序保留相同位置编号的原始先后。
     /// </summary>
     public void RearrangeLocation(CardLocation location)
     {
-        var cards = State.AllCards
+        var cards = State.AllCardsInBattleOrder
             .Where(c => c.Location == location)
             .OrderBy(c => c.LocationNumber)
             .ToList();
@@ -4377,9 +5401,8 @@ public sealed partial class CardApi
     /// `SetStopFurtherActions(GameStateRef, inStopFurtherActions)` / `GetStopFurtherActions()`
     /// （`_deps/BP_GameState_Battle.g.cs:3603-3618` / `:2569-2586`，各只有一行读写）。
     ///
-    /// ⚠️ 内核只建模**状态**；所有**读取点**都在 `AfterWaitCardPlayFromHand` 等
-    /// **库函数**里，而它们不在 `card-ir.json` 的调用点集合里 ⇒ 目前**没有消费者**。
-    /// 见 <see cref="GameState.StopFurtherActions"/> 的注释。
+    /// 状态由手牌打出、部署和额外触发流程消费；MatchEngine 与 CardApi
+    /// 在各阶段之间检查此标志并提前结束当前动作。
     /// </summary>
     public void SetStopFurtherActions(bool value) => State.StopFurtherActions = value;
 
@@ -4397,32 +5420,45 @@ public sealed partial class CardApi
     /// :4048      card.cardSeen = True         ; ★ 真正"标为已见"的那一步
     /// :4058  IsActionProcess ⇒ :4071 NotifyCardsSeen(Notifier, IDs, seen, showAnimation, enemyTurn)
     /// </code>
-    /// `NotifyCardsSeen` 是纯客户端通知（内核无 `CardFunctionsNotifier`），不实现。
+    /// 动作处理分支的 ZActionCardsSeen 载荷已接入；非动作模式仍待核查（RULE-108）。
     ///
     /// ⚠️ 第一个参数在蓝图里是**按引用进出的数组**（`Val.Out(...)` 回写）——
-    /// 本内核直接原地改传入的 `List&lt;CardInstance&gt;` 并返回，等价。
+    /// 本内核仅更新列表对象字段并保留原数组，通用VM的in/out引用接口仍待核查。
     /// </summary>
     public void ApplySetCardsSeenByCipher(List<CardInstance> cards, bool enemyTurn, bool showAnimation)
     {
-        _ = enemyTurn;
-        _ = showAnimation;
-
+        // Current pak Apply... i=253/294: each entry is independently checked.
+        // Keep duplicate IDs and already-seen cards; do not change the input list.
+        var ids = new List<int>();
         foreach (var card in cards)
         {
-            if (!IsLocatedInHand(card))
-            {
-                continue;
-            }
-
+            if (!IsLocatedInHand(card)) continue;
+            ids.Add(card.CardId);
             card.CardSeen = true;
         }
+
+        NotifyCardsSeen(ids, enemyTurn, showAnimation);
+    }
+
+    private void NotifyCardsSeen(IReadOnlyList<int> ids, bool enemyTurn, bool showAnimation)
+    {
+        // Headless engine uses the action-processing branch, as for the other
+        // notifier adapters. Non-action/remote receipt routing remains separate.
+        // NotifyCardsSeen -> HandleCardsSeen -> AddSubActionCardsSeen i=175.
+        _engine.FireSubAction("ZActionCardsSeen", new[]
+        {
+            ActionValue2.Str("cardIDs", string.Join(";", ids.Select(id => id.ToString(System.Globalization.CultureInfo.InvariantCulture)))),
+            ActionValue2.Str("seenValues", string.Join(";", Enumerable.Repeat("1", ids.Count))),
+            ActionValue2.Bool("showAnimation", showAnimation),
+            ActionValue2.Bool("enemyTurn", enemyTurn),
+        });
     }
 
     /// <summary>
     /// `SetCardSeen(cardID_Seen, instigatorID, out qqq)`。
     ///
     /// 蓝图先按第一个参数解析目标卡，再写入该卡的 `cardSeen = true`；
-    /// 第二个参数只用于客户端通知，内核没有通知层，因此不参与状态判定。
+    /// 第二个参数在当前权威函数体中未被读取，不参与状态判定。
     /// `qqq` 在正版函数中固定写为 0。
     /// </summary>
     public int SetCardSeen(int cardIdSeen, int instigatorId)
@@ -4465,34 +5501,23 @@ public sealed partial class CardApi
     /// </summary>
     public void SetCardsSeenByCipher(int numberOfCardsSeen, int instigatorID, Side side)
     {
-        // ---- ① 先广播触发点 28（:34052-34084）----
-        var instigator = GetCardFromID(instigatorID);
-        FireTrigger(IntelTrigger, subject: null, side,
-                    eventSubject: instigator,
-                    eventArgs: new object?[] { instigator, numberOfCardsSeen },
-                    namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-                    {
-                        ["intelCard"] = instigator,
-                        ["intelValue"] = numberOfCardsSeen,
-                    },
-                    localsSeed: new Dictionary<string, object?>(StringComparer.Ordinal)
-                    {
-                        // 形参名逐字取蓝图卡版（`BP_CardFunctions.g.cs:34084`
-                        // `OnIntelTriggered(item, card, numberOfCardsSeen)`；
-                        // 权威形参名见 `_index.g.cs:4083` `{ "intelCard", "intelValue" }`）。
-                        ["intelCard"] = instigator,
-                        ["intelValue"] = numberOfCardsSeen,
-                    });
-
-        // ---- ② 攒「对手手牌里还没见过的卡」（:34107-34201）----
-        var unseen = new List<CardInstance>();
-        foreach (var card in State.Hand(side.Opposite()))
-        {
-            if (!card.CardSeen)
+        // i=10 materializes T28 once. No per-recipient zone, self, stop,
+        // registration, or suppression recheck; resolve instigator ID each time.
+        var recipients = CaptureRegisteredTriggerSnapshot(IntelTrigger);
+        var library = Blueprint.KismetLibrary.Default;
+        if (library is not null)
+            foreach (var observer in recipients)
             {
-                unseen.Add(card);
+                if (library.FindProgram(observer.Name, IntelTrigger) is null) continue;
+                var instigator = GetCardFromID(instigatorID);
+                TriggerTrace?.Add($"{IntelTrigger} → {observer.Name}#{observer.CardId}（eventCard={instigator?.Name ?? "null"}#{instigator?.CardId}）");
+                RunTriggerProgram(library, observer, observer.Name, IntelTrigger, instigator,
+                    eventArgs: new object?[] { instigator, numberOfCardsSeen },
+                    namedArgs: new Dictionary<string, object?> { ["intelCard"] = instigator, ["intelValue"] = numberOfCardsSeen });
             }
-        }
+
+        // i=458 runs AFTER all T28 callbacks; only then capture unseen cards.
+        var unseen = GetCardsInHandBySide(side.Opposite()).Where(card => !card.CardSeen).ToList();
 
         if (unseen.Count == 0)
         {
@@ -4501,11 +5526,13 @@ public sealed partial class CardApi
 
         // ---- ③ 洗牌 + 截断 + 标记（:34150-34174）----
         State.Random.Shuffle(unseen);
-        State.TraceRandom($"SetCardsSeenByCipher n={numberOfCardsSeen} unseen={unseen.Count} " +
-                          $"take={Math.Min(numberOfCardsSeen, unseen.Count)}");
-
         int take = Math.Min(numberOfCardsSeen, unseen.Count);
-        unseen.RemoveRange(take, unseen.Count - take);
+        State.TraceRandom($"SetCardsSeenByCipher n={numberOfCardsSeen} unseen={unseen.Count} " +
+                          $"resize={take} take={(take < 0 ? unseen.Count : take)}");
+
+        // The installed native Array_Resize warns and leaves the array intact
+        // for negative sizes. The Blueprint still calls Apply afterwards.
+        if (take >= 0) unseen.RemoveRange(take, unseen.Count - take);
         ApplySetCardsSeenByCipher(unseen, enemyTurn: false, showAnimation: true);
     }
 
@@ -4520,15 +5547,11 @@ public sealed partial class CardApi
     /// 加它是因为 `GotchaTriggered` 的 `cipher &gt; 0` 门（`:23766`）读的就是这个成员 ——
     /// **没有这个写入方，那道门永远是假**。
     ///
-    /// ⚠️ CDO 默认值缺失（如实标注）：`cipher` 在客户端是卡 CDO 的成员，
-    /// `decompiled/cards.all.json` 里 **25 张卡**带非 0 的 `cipher`
-    /// （`card_event_espionage_skirm`=9 / `card_event_infiltrate`=2 / `card_unit_7th_scottish_borderers`=3 …），
-    /// 但**52 张 gotcha 卡一张都没有** ⇒ gotcha 卡的 `cipher` 初值就是 0。
-    /// 本内核的卡数据（`docs/cards.live.json` / `docs/card-effects.json`）
-    /// **不含 `cipher` 字段**，而补 CDO 表要改 `Cards/CardVarDefaults.cs`（本轮不在改动范围内）
-    /// ⇒ 那 25 张卡的 `cipher` 初值目前是 0（偏小）。影响面：`card_event_act_on_the_intel`
-    /// 的 `unSeenCards - self.cipher` 与 `card_unit_16th_tarnow_regiment` 的
-    /// `cardPlayed.cipher &gt; 0`。**已核实为已知缺口**。
+    /// 卡实例由 pak CDO 中提取的默认 `cipher` 初始化：25 张卡为非 0，
+    /// 包括 `card_event_espionage_skirm`=9、`card_event_infiltrate`=2 和
+    /// `card_unit_7th_scottish_borderers`=3。52 张 gotcha 卡的初值均为 0。
+    /// 这会影响 `card_event_act_on_the_intel` 的 `unSeenCards - self.cipher`
+    /// 与 `card_unit_16th_tarnow_regiment` 的 `cardPlayed.cipher &gt; 0` 分支。
     /// </summary>
     public void AddIntelToCard(int cardId, int amount)
     {
@@ -4764,7 +5787,7 @@ public sealed partial class CardApi
     /// :28080  card.location == 4 (HandRight) || :28082 card.location == 3 (HandLeft)
     /// :28088  IsGotcha(card)                                    ; 不是反制卡 ⇒ 整段跳过
     /// :28092  card.gotchaActivated &gt; 0                          ; 已经激活过
-    /// :28096      card.gotchaActivated = 0                      ;   ⇒ 正常打出，取消激活
+    /// :28096      card.gotchaActivated = 0                      ;   ⇒ 再次直接出牌，取消激活
     /// :28239  否则 _nextGotchaActivated = 0（局部零初始化）
     /// :28243  for each item in GetAllCardInBattle()：
     /// :28259      IsGotcha(item)
@@ -4777,13 +5800,9 @@ public sealed partial class CardApi
     ///
     /// ## 为什么必须有这个写入方
     ///
-    /// `gotchaActivated` 的**唯一**写入方就是这段（蓝图全量 grep：
-    /// 只有 `:28096` / `:28316` / `GotchaTriggered:23735` 三处，后一处是**置 0**）。
-    /// 没有它，`gotchaActivated` 恒为 0 ⇒ `GetActiveGotchasOrdered` 的 `&gt; 0` 过滤
-    /// 恒空 ⇒ 整个反制子系统空转。
-    ///
-    /// `PlayCardDirectlyFromHand` 的派发入口已接到 `MatchEngine.PlayCardDirectlyFromHand`；
-    /// 普通出牌与直接出牌都会在离手前经过这里，因此 Gotcha 序号与蓝图保持一致。
+    /// 这是直接出牌分支的激活辅助逻辑，并非激活号的唯一写入点。
+    /// BP_OnlineMatch.ReceiveActionPlayCardFromHand 也会在接收阶段
+    /// 写入 kreditsPayed、装填或取消；本地 Gotcha 的接收状态由 MatchEngine 单独应用。
     /// </summary>
     public void AssignGotchaActivatedOnPlayFromHand(CardInstance card)
     {
@@ -4799,7 +5818,7 @@ public sealed partial class CardApi
             return;
         }
 
-        // :28092/:28096 —— 已经激活过的（再次正常打出）⇒ 取消激活
+        // :28092/:28096 —— 已经激活过的（再次直接出牌）⇒ 取消激活
         if (card.GotchaActivated > 0)
         {
             card.GotchaActivated = 0;
@@ -4836,7 +5855,7 @@ public sealed partial class CardApi
     /// <see cref="CardInstance.BuffsBySource"/> 上那段说明：临时的和永久的两笔
     /// 必须分开存，否则回合结束清理会把永久那笔一起删掉。
     /// </summary>
-    private static CardBuff GetOrCreateBuff(CardInstance card, int sourceCardId, bool temporary = false)
+    private CardBuff GetOrCreateBuff(CardInstance card, int sourceCardId, bool temporary = false)
     {
         var key = (sourceCardId, temporary);
         if (!card.BuffsBySource.TryGetValue(key, out var buff))
@@ -4845,6 +5864,28 @@ public sealed partial class CardApi
             card.BuffsBySource[key] = buff;
         }
 
+        SynchronizeBuffTarget(card, sourceCardId);
         return buff;
+    }
+
+    // ChangeBuffsFromCards i=2471..3024: only a currently valid source object
+    // owns the array. Do not rebuild it from ID relations on reads.
+    private void SynchronizeBuffTarget(CardInstance target, int sourceId)
+    {
+        if (sourceId <= 0 || State.ById(sourceId) is not { } source) return;
+        bool hasRelation = target.BuffsBySource.Keys.Any(k => k.SourceCardId == sourceId);
+        if (hasRelation)
+        {
+            if (!source.CardsBuffedByThisCard.Contains(target.CardId))
+                source.CardsBuffedByThisCard.Add(target.CardId);
+        }
+        else source.CardsBuffedByThisCard.RemoveAll(id => id == target.CardId);
+    }
+
+    private bool RemoveBuffEntry(CardInstance card, (int SourceCardId, bool Temporary) key)
+    {
+        bool removed = card.BuffsBySource.Remove(key);
+        SynchronizeBuffTarget(card, key.SourceCardId);
+        return removed;
     }
 }

@@ -31,8 +31,34 @@ public sealed class GameState
 
     /// <summary>左/右两侧，索引 1/2（与 <see cref="Side"/> 对齐，0 位弃用）。</summary>
     private readonly List<CardInstance>[] _cardsBySide = { new(), new(), new() };
+    private readonly Dictionary<(Side Side, int CardId), int> _pendingDeckRemovals = new();
 
     private readonly Dictionary<int, CardInstance> _byCardId = new();
+    private readonly List<CardInstance> _battleCardOrder = new();
+    private readonly List<int> _autoPlayerCardIds = new();
+
+    // BP_GameState_Battle uses an ordered integer array, not a card/location query.
+    public void AddAutoPlayCards(int cardId)
+    {
+        if (!_autoPlayerCardIds.Contains(cardId)) _autoPlayerCardIds.Add(cardId);
+    }
+
+    public int[] GetAutoPlayCards() => _autoPlayerCardIds.ToArray();
+    public void ClearAutoPlayCards() => _autoPlayerCardIds.Clear();
+
+    // tempBuffGive is a removable source slot, not a duration. Blueprint
+    // AddAttackUntilEndOfTurn separately registers (buffType=0, instigatorID).
+    private readonly Dictionary<int, List<int>> _buffsToRemoveEndOfTurn = new();
+    public void AddBuffsToRemoveEndOfTurn(int buffType, int instigatorId)
+    {
+        if (!_buffsToRemoveEndOfTurn.TryGetValue(buffType, out var sources))
+            _buffsToRemoveEndOfTurn[buffType] = sources = [];
+        if (!sources.Contains(instigatorId)) sources.Add(instigatorId);
+    }
+
+    public Dictionary<int, int[]> GetBuffsToRemoveEndOfTurn()
+        => _buffsToRemoveEndOfTurn.ToDictionary(kv => kv.Key, kv => kv.Value.ToArray());
+    public void ClearBuffsToRemoveEndOfTurn() => _buffsToRemoveEndOfTurn.Clear();
 
     public GameState(CardDatabase database, ulong seed)
     {
@@ -157,6 +183,37 @@ public sealed class GameState
     public Side ActiveSide { get; set; } = Side.Left;
     public Side StartingSide { get; set; } = Side.Left;
 
+    /// <summary>
+    /// The side owned by this game client.  This is the value stored by
+    /// <c>AkardsGameState::SetupSidesInBattle</c>; it is independent from
+    /// <see cref="ActiveSide"/> and therefore must not be derived from the
+    /// current turn.
+    /// </summary>
+    public Side ClientSide { get; private set; } = Side.Left;
+
+    /// <summary>The side opposite the client side, as in the native game state.</summary>
+    public Side OpponentSide => ClientSide.Opposite();
+
+    /// <summary>
+    /// Mirrors the native <c>SetupSidesInBattle</c> state write.  Unknown enum
+    /// values are preserved as <see cref="Side.NotAvailable"/> rather than
+    /// silently becoming one of the playable sides.
+    /// </summary>
+    public void SetupSidesInBattle(Side clientSide)
+        => ClientSide = clientSide is Side.Left or Side.Right
+            ? clientSide
+            : Side.NotAvailable;
+
+    /// <summary>
+    /// Full native-shaped overload.  The opponent value is validated against
+    /// the two-sided game; inconsistent input leaves the client side unknown.
+    /// </summary>
+    public void SetupSidesInBattle(Side clientSide, Side opponentSide)
+        => ClientSide = clientSide is Side.Left or Side.Right
+            && opponentSide == clientSide.Opposite()
+            ? clientSide
+            : Side.NotAvailable;
+
     /// <summary>Blueprint `DestroyedCardIDsByTurnNumber`, indexed by battle turn.</summary>
     public Dictionary<int, List<int>> DestroyedCardIdsByTurn { get; } = new();
 
@@ -168,8 +225,16 @@ public sealed class GameState
             ? ids
             : Array.Empty<int>();
 
-    public void RecordDestroyedCard(int cardId, bool isUnit)
+    public List<int> DestroyedCardIdsAll { get; } = new();
+    private readonly List<int>[] _destroyedBySide = { new(), new(), new() };
+    public IReadOnlyList<int> DestroyedCardsIdsBySide(Side side) => _destroyedBySide[(int)side];
+
+    public void RecordDestroyedCard(int cardId, Side side, bool isUnit)
     {
+        // UpdateDestroyedCardsIDs appends every death globally/per side, but
+        // uses AddUnique in the current turn's list. Discarding is not death.
+        DestroyedCardIdsAll.Add(cardId);
+        if (side is Side.Left or Side.Right) _destroyedBySide[(int)side].Add(cardId);
         if (!DestroyedCardIdsByTurn.TryGetValue(Turn, out var ids))
         {
             ids = new List<int>();
@@ -199,6 +264,8 @@ public sealed class GameState
     // match-wide value for the active turn.
     private readonly int[] _hqDamagedThisTurn = new int[3];
     public int OperationKreditsSpentThisTurn { get; private set; }
+    /// <summary>BP_GameState_Battle.stopAttack; shared across reentrant attack calls.</summary>
+    public bool StopAttack { get; set; }
 
     public int GetHQDamagedAmountThisTurn(Side side)
         => side is Side.Left or Side.Right ? _hqDamagedThisTurn[(int)side] : 0;
@@ -256,15 +323,14 @@ public sealed class GameState
     /// 读：`GetStopFurtherActions()`，只在卡牌打出链里当**提前退出**的门用
     /// （`BP_CardFunctions.g.cs:684/5887/6316/14937/15673/16567`）。
     ///
-    /// ## ⚠️ 内核只建模**状态**，没有建模**消费者**
-    ///
-    /// 所有读取点都在 `AfterWaitCardPlayFromHand` / `CardPlayedFromHand` /
-    /// `PlayCardFromHand` 这一族**库函数**里，而它们**不在 `card-ir.json` 的调用点集合里**
-    /// （IR 只含每张卡自己的事件体）。⇒ 本内核设置这个标志后**没有代码读它**，
-    /// 效果是惰性的。如实记录：**这是"状态已就位、消费方未接线"**，
-    /// 不是"已经实现了 stopFurtherActions 的语义"。
+    /// MatchEngine 的手牌打出流程和 CardApi 的部署/额外触发流程
+    /// 在阶段之间检查此标志。这里记录消费位置；其完整客户端语义
+    /// 仍需要在系统审计中逐个比对读取点。
     /// </summary>
     public bool StopFurtherActions { get; set; }
+
+    /// <summary>BP_GameState_Battle.SetActiveBondsAtStartOfTurn: revealed own unit factions, frozen for this turn.</summary>
+    public HashSet<string> ActiveBondFactions { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// 前线**限制者**卡 ID 的集合（对应 `BP_GameState_Battle.FrontlineLimiters`
@@ -451,6 +517,7 @@ public sealed class GameState
     // ==================== 卡牌增删查 ====================
 
     public IReadOnlyList<CardInstance> AllCards => _byCardId.Values.OrderBy(c => c.CardId).ToList();
+    public IReadOnlyList<CardInstance> AllCardsInBattleOrder => _battleCardOrder.ToArray();
 
     /// <summary>
     /// 无序的卡牌枚举 —— 热路径专用（<see cref="AllCards"/> 每次都会排序+分配）。
@@ -519,7 +586,31 @@ public sealed class GameState
         return result;
     }
 
-    public List<CardInstance> Deck(Side s) => Cards(s, s.DeckOf());
+    public List<CardInstance> Deck(Side s)
+    {
+        var cards = Cards(s, s.DeckOf());
+        if (_pendingDeckRemovals.Count != 0)
+            cards.RemoveAll(c => _pendingDeckRemovals.ContainsKey((s, c.CardId)));
+        return cards;
+    }
+
+    /// <summary>
+    /// A deck-removal phase can precede the object's location update. Deck
+    /// queries exclude the removed ID while physical-location queries retain it.
+    /// This scoped view is not a general replacement for native deck arrays.
+    /// </summary>
+    public void WithDeckCardRemoved(Side side, int cardId, Action phase)
+    {
+        var key = (side, cardId);
+        int previous = _pendingDeckRemovals.GetValueOrDefault(key);
+        _pendingDeckRemovals[key] = previous + 1;
+        try { phase(); }
+        finally
+        {
+            if (previous == 0) _pendingDeckRemovals.Remove(key);
+            else _pendingDeckRemovals[key] = previous;
+        }
+    }
     public List<CardInstance> Hand(Side s) => Cards(s, s.HandOf());
     public List<CardInstance> Board(Side s) => Cards(s).FindAll(c => c.Location.IsBoard() && !c.IsHq);
 
@@ -532,8 +623,9 @@ public sealed class GameState
     /// `Map_Values(self.AllCardsInBattle)` ⇒ 顺序 = **这个 `TMap` 的迭代顺序**。
     /// 而 `AddCardToAllCardsInBattle`（同文件 `:301-319`）是
     /// 「`cardID &gt; 0` 且 `Map_Find` 查不到 ⇒ `Map_Add`」——
-    /// **全树 0 处 `Map_Remove`** ⇒ 该映射**只增不删**、永不出现 swap-remove 的洞
-    /// ⇒ **`Map_Values` 的顺序就是插入顺序**（= 卡进入战斗的顺序）。
+    /// 当前完整蓝图导出未发现该映射的Map_Remove，只有登记与整局清空。
+    /// 当前无单卡删除的规则路径以全局登记顺序建模，换主不重排；原生反射
+    /// 写入、外部恢复或空槽复用仍需独立证据，不能据此证明所有TMap行为。
     ///
     /// ⚠️ `Board(s)` 是按 `LocationNumber` **排序**的（见 <see cref="Cards"/>），
     /// 与客户端的插入序**不是一回事**。而「随机挑一张」这类效果的候选集顺序
@@ -541,7 +633,7 @@ public sealed class GameState
     /// 见 `CardApi.GetRandomCard` 的注释），所以**随机族必须用本方法**。
     /// </summary>
     public List<CardInstance> BoardInBattleOrder(Side s)
-        => _cardsBySide[(int)s].FindAll(c => c.Location.IsBoard() && !c.IsHq);
+        => _battleCardOrder.FindAll(c => c.Owner == s && c.Location.IsBoard() && !c.IsHq);
 
     /// <summary>
     /// 该方**在战场上**的**全部**卡（**含 HQ**），按**进入战斗的顺序**。
@@ -553,7 +645,7 @@ public sealed class GameState
     /// 详见 <see cref="BoardInBattleOrder"/> 里那段蓝图依据。
     /// </summary>
     public List<CardInstance> BattleCardsInOrder(Side s)
-        => _cardsBySide[(int)s].FindAll(c => c.Location.IsBoard());
+        => _battleCardOrder.FindAll(c => c.Owner == s && c.Location.IsBoard());
     public List<CardInstance> Discard(Side s) => Cards(s, CardLocation.Discard);
 
     public CardInstance Hq(Side s) => _cardsBySide[(int)s].First(c => c.IsHq);
@@ -585,7 +677,7 @@ public sealed class GameState
     public CardInstance Create(string cardName, Side owner, CardLocation location, int locationNumber,
                                bool isGold = false, bool sequentialId = false,
                                bool isSalvaged = false, string? salvageFaction = null,
-                               int salvagedCardId = 0)
+                               int salvagedCardId = 0, bool skipCreationModifiers = false, bool? cardSeenBeforeModifiers = null)
     {
         CardDefinition def = Database.Require(cardName);
         var card = new CardInstance
@@ -629,6 +721,7 @@ public sealed class GameState
         };
 
         _byCardId[card.CardId] = card;
+        _battleCardOrder.Add(card);
         _cardsBySide[(int)owner].Add(card);
 
         // 先灌卡面自带的关键字（Blitz/Guard/…），再算派生数值。
@@ -639,6 +732,10 @@ public sealed class GameState
         // i=2610 `CallFunc_SpawnObject_ReturnValue.OnCreateCard()`。
         // 签名 `BaseCardObject.h:703 void OnCreateCard();`（无参、只有"自己"这一路）。
         CardCreated?.Invoke(card);
+        // CreateCard i=400 follows CreateCardObject's own OnCreateCard, but
+        // precedes T35. Null preserves the lower-level creation callers.
+        if (cardSeenBeforeModifiers.HasValue) card.CardSeen = cardSeenBeforeModifiers.Value;
+        if (!skipCreationModifiers) CardCreationModifiers?.Invoke(card);
 
         // 游标探针：把"效果生成的卡"也记进流水账 —— 才能把
         // 「客户端说 cardID X 是卡 A」与「内核在什么时候、按什么顺序生成了 X」对上。
@@ -692,6 +789,7 @@ public sealed class GameState
         };
 
         _byCardId[cardId] = card;
+        _battleCardOrder.Add(card);
         _cardsBySide[(int)owner].Add(card);
 
         // 同上：灌卡面关键字 + 派生数值统一重算
@@ -705,6 +803,7 @@ public sealed class GameState
 
         // 同上：`CreateCardObject` 的 `OnCreateCard`（回放路径也走这个入口）。
         CardCreated?.Invoke(card);
+        CardCreationModifiers?.Invoke(card);
         return card;
     }
 
@@ -825,16 +924,17 @@ public sealed class GameState
         hq.MaxDefense = Math.Max(hq.MaxDefense, defense);
     }
 
-    /// <summary>把卡移动到新位置，并重排目标位置的 location_number（与客户端语义一致）。</summary>
+    /// <summary>把卡移动到新位置；默认重排目标编号，直接字段赋值路径可保留原编号。</summary>
     public void Move(CardInstance card, CardLocation location, int? locationNumber = null,
-                     bool changeOwner = false)
+                     bool changeOwner = false, CardMoveReason moveReason = CardMoveReason.Uncategorized,
+                     bool notifyMoved = true, bool normalizeLocation = true)
     {
         CardLocation oldLocation = card.Location;
         bool moved = oldLocation != location;
 
         card.Location = location;
         card.LocationNumber = locationNumber ?? NextLocationNumber(card.Owner, location);
-        NormalizeLocationNumbers(card.Owner, location);
+        if (normalizeLocation) NormalizeLocationNumbers(card.Owner, location);
 
         // 换区之后派生数值可能变（最典型的是「手牌里才 -1 费」的光环：
         // card_unit_85_pioneer_company 只给**手牌里**的指令减费，
@@ -846,9 +946,9 @@ public sealed class GameState
         // ⚠️ 只有**真的换了区**才发：蓝图 `ExecuteOnCardLocationMoved` 是
         //    `CardLocationMoved(cardID, …, oldLocation, newLocation, …)` 调进来的，
         //    同区重排（改 locationNumber）不走它。
-        if (moved)
+        if (moved && notifyMoved)
         {
-            CardMoved?.Invoke(card, oldLocation, location, changeOwner);
+            CardMoved?.Invoke(card, oldLocation, location, changeOwner, moveReason);
         }
     }
 
@@ -857,13 +957,13 @@ public sealed class GameState
     /// <c>OnOtherCardLocationMoved</c> 上）。
     /// GameState 不认识 CardApi，所以只留一个钩子。
     /// </summary>
-    public Action<CardInstance, CardLocation, CardLocation, bool>? CardMoved { get; set; }
+    public Action<CardInstance, CardLocation, CardLocation, bool, CardMoveReason>? CardMoved { get; set; }
 
     /// <summary>
     /// 改变当前控制方，同时维护按阵营索引。位置本身由调用方随后通过
     /// <see cref="Move"/> 更新，这样换区触发器仍能看到旧位置。
     /// </summary>
-    public bool ChangeOwner(CardInstance card, Side newOwner)
+    public bool ChangeOwner(CardInstance card, Side newOwner, bool normalize = true)
     {
         if (newOwner is Side.NotAvailable || card.Owner == newOwner)
         {
@@ -874,12 +974,15 @@ public sealed class GameState
         _cardsBySide[(int)oldOwner].Remove(card);
         card.Owner = newOwner;
         _cardsBySide[(int)newOwner].Add(card);
-        NormalizeLocationNumbers(oldOwner, card.Location);
+        if (normalize) NormalizeLocationNumbers(oldOwner, card.Location);
         return true;
     }
 
     /// <summary>卡对象被创建时的回调（对应蓝图 <c>CreateCardObject</c> 里的 <c>OnCreateCard</c>）。</summary>
     public Action<CardInstance>? CardCreated { get; set; }
+
+    /// <summary>CreateCard 包装器的 T35 阶段，独立于对象自身 OnCreateCard。</summary>
+    public Action<CardInstance>? CardCreationModifiers { get; set; }
 
     public int NextLocationNumber(Side side, CardLocation location)
     {
@@ -901,6 +1004,7 @@ public sealed class GameState
     public void Remove(CardInstance card)
     {
         _byCardId.Remove(card.CardId);
+        _battleCardOrder.Remove(card);
         _cardsBySide[(int)card.Owner].Remove(card);
         card.Location = CardLocation.NotAvailable;
     }
@@ -928,12 +1032,22 @@ public sealed class GameState
         IsFrontlineLimited,
         AllCards.Select(c => c.Snapshot()).ToArray())
         {
+            DestroyedCardIdsAll = DestroyedCardIdsAll.ToArray(),
+            DestroyedCardIdsLeft = DestroyedCardsIdsBySide(Side.Left).ToArray(),
+            DestroyedCardIdsRight = DestroyedCardsIdsBySide(Side.Right).ToArray(),
+            DestroyedCardIdsByTurn = DestroyedCardIdsByTurn.OrderBy(kv => kv.Key).ToDictionary(kv => kv.Key, kv => kv.Value.ToArray()),
+            UnitDestroyedThisTurn = UnitDestroyedThisTurn,
             LeftKreditSlotsLost = KreditSlotsLost(Side.Left),
             RightKreditSlotsLost = KreditSlotsLost(Side.Right),
             LeftHQDamagedThisTurn = GetHQDamagedAmountThisTurn(Side.Left),
             RightHQDamagedThisTurn = GetHQDamagedAmountThisTurn(Side.Right),
             OperationKreditsSpentThisTurn = OperationKreditsSpentThisTurn,
             HasPlayedWeatherCardThisTurn = HasPlayedWeatherCardThisTurn,
+            ActiveBondFactions = ActiveBondFactions.OrderBy(x => x, StringComparer.Ordinal).ToArray(),
+            BattleCardOrder = _battleCardOrder.Select(c => c.CardId).ToArray(),
+            AutoPlayerCardIds = GetAutoPlayCards(),
+            BuffsToRemoveEndOfTurn = GetBuffsToRemoveEndOfTurn(),
+            LeftFatigue = Fatigue(Side.Left), RightFatigue = Fatigue(Side.Right),
             FrontlineLimiterIds = FrontlineLimiters.OrderBy(id => id).ToArray(),
             // Preserve list order: future dispatch can depend on insertion order.
             Restrictions = GameplayRestrictions.Select(x => new GameplayRestrictionSnapshot(
@@ -983,12 +1097,23 @@ public sealed record MatchSnapshot(
     bool IsFrontlineLimited,
     CardSnapshot[] Cards)
 {
+    public int[] DestroyedCardIdsAll { get; init; } = [];
+    public int[] DestroyedCardIdsLeft { get; init; } = [];
+    public int[] DestroyedCardIdsRight { get; init; } = [];
+    public Dictionary<int, int[]> DestroyedCardIdsByTurn { get; init; } = new();
+    public bool UnitDestroyedThisTurn { get; init; }
     public int LeftKreditSlotsLost { get; init; }
     public int RightKreditSlotsLost { get; init; }
     public int LeftHQDamagedThisTurn { get; init; }
     public int RightHQDamagedThisTurn { get; init; }
     public int OperationKreditsSpentThisTurn { get; init; }
     public bool HasPlayedWeatherCardThisTurn { get; init; }
+    public string[] ActiveBondFactions { get; init; } = Array.Empty<string>();
+    public int[] BattleCardOrder { get; init; } = [];
+    public int[] AutoPlayerCardIds { get; init; } = [];
+    public Dictionary<int, int[]> BuffsToRemoveEndOfTurn { get; init; } = new();
+    public int LeftFatigue { get; init; }
+    public int RightFatigue { get; init; }
     public int[] FrontlineLimiterIds { get; init; } = Array.Empty<int>();
     public GameplayRestrictionSnapshot[] Restrictions { get; init; } = Array.Empty<GameplayRestrictionSnapshot>();
     public GameplaySideEffectSnapshot[] SideEffects { get; init; } = Array.Empty<GameplaySideEffectSnapshot>();
@@ -1016,6 +1141,7 @@ public sealed record SubAction(string Name, IReadOnlyList<ActionValue2> Values);
 public sealed record ActionValue2(string Name, int Value, string Text = "")
 {
     public static ActionValue2 Int(string name, int value) => new(name, value);
-    public static ActionValue2 Str(string name, string value) => new(name, 0, value);
+    // BP_OnlineMatch.ActionValueString i=36 stores -1 in the numeric field.
+    public static ActionValue2 Str(string name, string value) => new(name, -1, value);
     public static ActionValue2 Bool(string name, bool value) => new(name, value ? 1 : 0);
 }

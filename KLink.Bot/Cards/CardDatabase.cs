@@ -30,9 +30,32 @@ public sealed class CardDefinition
     public int Attack { get; init; }
     public int Defense { get; init; }
     public int Range { get; init; }
+    public int EffectType { get; init; }
+    public int ChooseOneOptionCount { get; init; }
+    public IReadOnlyList<bool> ChooseOneSelectTargets { get; init; } = [];
+    public bool SelectTargetOnPlayedFromHand { get; init; }
+    public string CustomName1 { get; init; } = "None";
+    public string CustomName2 { get; init; } = "None";
+    public int Cipher { get; init; }
+    public int TargetTax { get; init; }
+    /// <summary>CDO: defer played/entry observers until OnHandTargetSelected completes.</summary>
+    public bool WaitForHandTarget { get; init; }
+    public IReadOnlyDictionary<string, int[]> InnateAbilities { get; init; }
+        = new Dictionary<string, int[]>(StringComparer.Ordinal);
+    public IReadOnlyList<string> SuppressionExceptionTriggers { get; init; } = [];
+    /// <summary>CDO usedTriggers, registered by CreateCardObject in the event map.</summary>
+    public IReadOnlyList<string> UsedTriggers { get; init; } = [];
+
+    // The SDK enum names T33 OnOtherCardBlitzChange; its callback UFunction
+    // is named OnOtherCardBlitzChanged. It is distinct from T29.
+    public static string RegisteredTriggerName(string programName)
+        => programName == "OnOtherCardBlitzChanged" ? "OnOtherCardBlitzChange" : programName;
+
+    public bool IsRegisteredFor(string programName)
+        => UsedTriggers.Contains(RegisteredTriggerName(programName), StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// 卡面自带的重甲点数（CDO 的 <c>heavyArmor</c>，全部 2021 张里只有 52 张有）。
+    /// 卡面自带的重甲点数（CDO 的 <c>heavyArmor</c>，全部 2019 张里只有 52 张有）。
     ///
     /// 之前没有这个字段，`ChangeHeavyArmor` 就只能靠关键字表示「有没有重甲」，
     /// 而它是**可叠加的数值**（`card_unit_214th_amur` 的「你的 T-34 +1 重甲」）。
@@ -66,6 +89,18 @@ public sealed class CardDefinition
     /// 只存字符串的话这个比较永远拿不到正确的一侧。
     /// </summary>
     public int FactionId { get; init; }
+
+    // Verified against all current pak labels and read-only card CDO scalars.
+    public int TypeId => Type switch
+    {
+        "location" => 1, "order" => 2, "tank" => 3, "fighter" => 4,
+        "bomber" => 5, "infantry" => 6, "artillery" => 7,
+        "gotcha" => 11, "wildcard" => 12, _ => 0,
+    };
+    public int RarityId => Rarity switch
+    {
+        "Common" => 1, "Uncommon" => 2, "Rare" => 3, "Unique" => 4, _ => 0,
+    };
 
     /// <summary>该卡在反编译里用到的所有「外部」调用名（去掉 BP 内置与 BP_OnlineMatch 内部函数）。</summary>
     public IReadOnlyList<string> ExternalCalls { get; init; } = Array.Empty<string>();
@@ -302,6 +337,20 @@ public sealed class CardDatabase
                 Attack = c.Attack ?? 0,
                 Defense = c.Defense ?? 0,
                 Range = c.Range ?? 0,
+                // The pak exporter retains nonzero enum ordinals in this form.
+                EffectType = int.TryParse(c.EffectType?.Replace("UASSETAPI_INVALID_ENUM_IDX_", "", StringComparison.Ordinal),
+                    out int effectType) ? effectType : 0,
+                ChooseOneOptionCount = c.ChooseOneOptionCount,
+                ChooseOneSelectTargets = c.ChooseOneSelectTargets ?? [],
+                SelectTargetOnPlayedFromHand = c.SelectTargetOnPlayedFromHand,
+                CustomName1 = c.CustomName1 ?? "None",
+                CustomName2 = c.CustomName2 ?? "None",
+                Cipher = c.Cipher ?? 0,
+                TargetTax = c.TargetTax ?? 0,
+                WaitForHandTarget = c.WaitForHandTarget,
+                InnateAbilities = c.InnateAbilities ?? new Dictionary<string, int[]>(StringComparer.Ordinal),
+                SuppressionExceptionTriggers = c.SuppressionExceptionTriggers ?? [],
+                UsedTriggers = c.UsedTriggers ?? [],
                 // 优先用 CDO 表的值；表里没有才退回 cards 文件（后者目前恒 0）
                 HeavyArmor = innateArmor > 0 ? innateArmor : c.HeavyArmor ?? 0,
                 Keywords = innateKeywords,
@@ -352,7 +401,19 @@ public sealed class CardDatabase
         [JsonPropertyName("attack")] public int? Attack { get; set; }
         [JsonPropertyName("defense")] public int? Defense { get; set; }
         [JsonPropertyName("range")] public int? Range { get; set; }
+        [JsonPropertyName("effectType")] public string? EffectType { get; set; }
         [JsonPropertyName("heavyArmor")] public int? HeavyArmor { get; set; }
+        [JsonPropertyName("chooseOneOptionCount")] public int ChooseOneOptionCount { get; set; }
+        [JsonPropertyName("chooseOneSelectTargets")] public bool[]? ChooseOneSelectTargets { get; set; }
+        [JsonPropertyName("selectTargetOnPlayedFromHand")] public bool SelectTargetOnPlayedFromHand { get; set; }
+        [JsonPropertyName("customName1")] public string? CustomName1 { get; set; }
+        [JsonPropertyName("customName2")] public string? CustomName2 { get; set; }
+        [JsonPropertyName("cipher")] public int? Cipher { get; set; }
+        [JsonPropertyName("targetTax")] public int? TargetTax { get; set; }
+        [JsonPropertyName("waitForHandTarget")] public bool WaitForHandTarget { get; set; }
+        [JsonPropertyName("innateAbilities")] public Dictionary<string, int[]>? InnateAbilities { get; set; }
+        [JsonPropertyName("suppressionExceptionTriggers")] public string[]? SuppressionExceptionTriggers { get; set; }
+        [JsonPropertyName("usedTriggers")] public string[]? UsedTriggers { get; set; }
     }
 
     private sealed class EffectEntry

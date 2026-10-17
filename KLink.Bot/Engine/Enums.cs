@@ -70,6 +70,25 @@ public enum SpawnInDeckLocation
     Shuffle = 3,
 }
 
+/// <summary>Current pak's CardMoveReason EnumExport, joined to its DisplayNameMap.</summary>
+public enum CardMoveReason
+{
+    AdvancePlayerMove = 0,
+    AdvanceForce = 1,
+    BoardToHand = 2,
+    ToTopOfDeck = 3,
+    PlayCardPlayerMove = 4,
+    ControlRelease = 5,
+    ControlTake = 6,
+    ChangeForce = 7,
+    PlayCardForce = 8,
+    Retreat = 9,
+    Destroyed = 10,
+    Removed = 11,
+    Uncategorized = 12,
+    Convert = 13,
+}
+
 public static class SideExtensions
 {
     public static Side Opposite(this Side side) => side switch

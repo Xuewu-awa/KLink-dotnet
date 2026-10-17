@@ -18,6 +18,35 @@ namespace KLink.Bot.Engine;
 /// </summary>
 public sealed class MatchEngine
 {
+    // A selection response occurs after the requesting Blueprint has returned.
+    // Keep this order in headless play while resolving the choice synchronously.
+    private Queue<Action>? _pendingSelections;
+    private readonly Dictionary<int, Action> _waitPlayContinuations = new();
+
+    internal void ResolveHandSelection(CardInstance selecting, Func<bool> resolve, bool updateExtraTriggers,
+        bool defer = true, bool consumeAutoPlay = true)
+    {
+        void Complete()
+        {
+            if (!resolve()) return; // No reply is different from a reply selecting card ID 0.
+            if (_waitPlayContinuations.Remove(selecting.CardId, out var continuation))
+                continuation(); // BP_OnlineMatch: AfterWait before HandleExtraPlayTriggers.
+            // Reply actions consume after their own callback / AfterWait, but
+            // CardToDrawSelected i=1677 precedes HandleExtraPlayTriggers i=1737.
+            if (consumeAutoPlay) ExecuteAutoPlayCards();
+            if (updateExtraTriggers && selecting.ExtraPlayTriggers > 0)
+            {
+                selecting.ExtraPlayTriggers--;
+                Api.RunCardEffect(selecting, null);
+            }
+            else if (updateExtraTriggers)
+                Api.ResolveTriggerQueue();
+            if (consumeAutoPlay) ApplyPendingGotchaPlayReceipts();
+        }
+        if (defer && _pendingSelections is { } pending) pending.Enqueue(Complete);
+        else Complete();
+    }
+
     private int _effectResolutionDepth;
     private bool _processingForcedEndTurn;
     private Side? _pendingForcedEndTurnSide;
@@ -94,10 +123,10 @@ public sealed class MatchEngine
         // 而内核的 `GameState.Move` / `GameState.Create` 正好是它们对应的唯一入口。
         // 挂在这里等于"每一处换区都发"，不会漏。
         //
-        // ⚠️ 开局摆牌阶段发这些事件是**无害**的：`CardApi.FireTrigger` 的快照只含
-        //    「双方棋盘 + 弃牌堆」，那时两者都是空的（HQ 不算棋盘卡），所以没有人收到。
+        // 初始化牌组时尚未挂接这些钩子，该初始化生命周期仍待单独审计。
         State.CardMoved = FireLocationMoved;
         State.CardCreated = FireCardCreated;
+        State.CardCreationModifiers = FireCardCreationModifiers;
     }
 
     /// <summary>
@@ -108,14 +137,10 @@ public sealed class MatchEngine
     private void FireCardCreated(CardInstance card)
     {
         Api.FireTrigger("OnCreateCard", card, card.Owner);
-        Api.FireTrigger("OnOtherCardCreatedAlterCard", card, card.Owner,
-            eventArgs: new object?[] { card, 3 }, eventSubject: card,
-            namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-            {
-                ["cardPlayed"] = card,
-                ["method"] = 3,
-            });
     }
+
+    private void FireCardCreationModifiers(CardInstance card)
+        => Api.ExecuteCardCreationModifiers(card);
 
     /// <summary>
     /// 「某张卡换区了」—— 出处 `out/bp-cardfn.json` 函数
@@ -132,22 +157,20 @@ public sealed class MatchEngine
     /// 触发号 47 的依据：`ERegisteredCardFunction.h` 逐项数下来第 48 项 = `OnOtherCardLocationMoved`。
     /// 签名 `BaseCardObject.h:721/586`。
     ///
-    /// ⚠️ `moveReason` 蓝图侧是 `/Game/Structs/CardMoveReason` 结构体，
-    ///    事件桩里被 `GetEnumeratorUserFriendlyName` 转成 **String**（i=469/725）。
-    ///    本内核**没有建模这张枚举表**，一律传空串 —— 这是近似，不是复刻。
-    ///    影响面：`MoveReason` 的订阅者（读它的卡）会拿到空串。
+    /// `moveReason` 蓝图侧是 `/Game/Structs/CardMoveReason` 结构体，
+    /// 事件桩里被 `GetEnumeratorUserFriendlyName` 转成 **String**（i=469/725）。
+    /// 内核通过 <see cref="Effects.Blueprint.LiveRuleTables"/> 解析实时 pak
+    /// 导出的枚举名，再把这个字符串传给订阅者；未知值才回退为空串。
     /// </summary>
     private void FireLocationMoved(CardInstance card, CardLocation oldLocation,
-                                   CardLocation newLocation, bool changeOwner)
+                                   CardLocation newLocation, bool changeOwner, CardMoveReason moveReason)
+        => ExecuteLocationMovedEvents(card, oldLocation, newLocation, changeOwner, moveReason, true);
+
+    internal void ExecuteLocationMovedEvents(CardInstance card, CardLocation oldLocation,
+        CardLocation newLocation, bool changeOwner, CardMoveReason moveReason, bool manageLocation = false)
     {
-        var named = new Dictionary<string, object?>(StringComparer.Ordinal)
-        {
-            ["cardMoved"] = card,
-            ["oldLocation"] = (int)oldLocation,
-            ["newLocation"] = (int)newLocation,
-            ["ChangeOwner"] = changeOwner,
-            ["MoveReason"] = "",
-        };
+        // CardLocationMoved i=578 invokes the event helper before removing smoke (i=735).
+        ExecuteOnCardLocationMoved(card, oldLocation, newLocation, changeOwner, moveReason);
 
         // ---- 烟幕：移到**前线**就消失（P1，2026-09-30）----
         //
@@ -162,32 +185,18 @@ public sealed class MatchEngine
         // </code>
         // 放在这里而不是 `MoveUnit` 里：`CardLocationMoved` 是**所有**移位路径的
         // 唯一入口（移动 / 生成落场 / 退却），蓝图也是在它里面判的。
-        if (newLocation == CardLocation.BoardFrontline
-            && card.Keywords.Contains(Keyword.Smokescreen))
+        if (manageLocation && newLocation == CardLocation.BoardFrontline
+            && card.HasSmokescreen)
         {
-            Api.RemoveKeyword(card, Keyword.Smokescreen);
+            if (State.ById(card.CardId) is { } current) Api.RemoveSmokescreen(current, card.CardId, true, false);
         }
 
-        Api.FireTrigger("OnCardLocationMoved", card, card.Owner, "OnOtherCardLocationMoved",
-            eventArgs: new object?[] { card, (int)oldLocation, (int)newLocation, changeOwner, "" },
-            eventSubject: card,
-            namedArgs: named,
-            oldLocation: oldLocation,
-            newLocation: newLocation);
-
-        // T49：前线单位离开前线时的专用事件。它与通用换区事件并列，
-        // 只在 oldLocation == BoardFrontline 时触发，避免退回半场/手牌的
-        // 单位被重复解释为“从前线离开”。
-        if (oldLocation == CardLocation.BoardFrontline)
+        // CardLocationMoved i=775..987: T49 only runs from frontline to a
+        // support line, excluding same-location owner changes and other zones.
+        if (manageLocation && oldLocation == CardLocation.BoardFrontline
+            && newLocation is CardLocation.BoardHqLeft or CardLocation.BoardHqRight)
         {
-            Api.FireTrigger("OnMoveFromFrontline", card, card.Owner,
-                "OnOtherCardMoveFromFrontline",
-                eventArgs: new object?[] { card },
-                eventSubject: card,
-                namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-                {
-                    ["cardMoved"] = card,
-                });
+            ExecuteOnCardMoveFromFrontline(card);
         }
 
         // ---- 前线归属重算（P0，2026-10-01 实测 replay-214436）----
@@ -227,9 +236,8 @@ public sealed class MatchEngine
         // `ExecuteOnAfterLeaveBoardOrOwnerEvents` → si=29 `ExecuteOnCardDestroyedFunction`。
         // 内核 `Destroy` 里 `State.Move` 正好在 `OnDestroyed` 之前，同序。
         //
-        // ⚠️ 近似：`moveReason != 13` 这道门本内核判不了 —— 上面 `FireLocationMoved`
-        //    的注释已说明 `MoveReason` 恒传空串，所以这里恒当它成立。
-        if (oldLocation == CardLocation.BoardFrontline || newLocation == CardLocation.BoardFrontline)
+        if (manageLocation && moveReason != CardMoveReason.Convert
+            && (oldLocation == CardLocation.BoardFrontline || newLocation == CardLocation.BoardFrontline))
         {
             RefreshFrontlineOwner(card);
         }
@@ -240,31 +248,56 @@ public sealed class MatchEngine
     /// perform a logical reveal without changing the card's stored location.
     /// </summary>
     public void ExecuteOnCardLocationMoved(CardInstance card, CardLocation oldLocation,
-                                           CardLocation newLocation, bool changeOwner = false)
+                                           CardLocation newLocation, bool changeOwner = false,
+                                           CardMoveReason moveReason = CardMoveReason.Uncategorized)
     {
-        var args = new object?[] { card, (int)oldLocation, (int)newLocation, changeOwner, "" };
+        Effects.Blueprint.LiveRuleTables.TryGetEnumName("/Game/Structs/CardMoveReason.CardMoveReason",
+            (int)moveReason, out string reasonName);
+        var args = new object?[] { card, (int)oldLocation, (int)newLocation, changeOwner, reasonName };
         var named = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             ["cardMoved"] = card,
             ["oldLocation"] = (int)oldLocation,
             ["newLocation"] = (int)newLocation,
             ["ChangeOwner"] = changeOwner,
-            ["MoveReason"] = "",
+            ["MoveReason"] = reasonName,
         };
 
         if (!card.IsSuppressed)
         {
             Api.FireTrigger("OnCardLocationMoved", card, card.Owner,
-                eventArgs: args, eventSubject: card, namedArgs: named,
-                oldLocation: oldLocation, newLocation: newLocation);
+                eventArgs: new object?[] { (int)oldLocation, (int)newLocation, changeOwner, reasonName },
+                eventSubject: card, namedArgs: named,
+                oldLocation: oldLocation, newLocation: newLocation,
+                recipientSnapshot: new[] { card }, includeUnavailableRecipients: true);
         }
 
-        // The Blueprint's observer loop follows the subject hook.  A
-        // suppressed card skips only its own hook but still reaches observers.
-        Api.FireTrigger("OnOtherCardLocationMoved", card, card.Owner,
-            eventArgs: args, eventSubject: card, namedArgs: named,
-            oldLocation: oldLocation, newLocation: newLocation,
-            broadcastName: true);
+        // Native i=125 queries T47 after the own hook; its direct loop has
+        // no physical-zone filter, repeated suppression check or stop flag.
+        Api.ExecuteMovementObservers("OnOtherCardLocationMoved", card, args, named,
+            oldLocation: oldLocation, newLocation: newLocation);
+    }
+
+    /// <summary>Native T49: own hook, query observers, stop check before each saved item.</summary>
+    public void ExecuteOnCardMoveFromFrontline(CardInstance card)
+    {
+        if (!card.IsSuppressed)
+            Api.FireTrigger("OnMoveFromFrontline", card, card.Owner,
+                eventArgs: Array.Empty<object?>(), recipientSnapshot: new[] { card },
+                includeUnavailableRecipients: true);
+        Api.ExecuteMovementObservers("OnOtherCardMoveFromFrontline", card, new object?[] { card },
+            new Dictionary<string, object?> { ["cardMoved"] = card }, stopFurtherActions: true);
+    }
+
+    /// <summary>ExecuteOnEnterPlayEvents: unsuppressed self first, then T43 observers.</summary>
+    public void ExecuteOnEnterPlayEvents(CardInstance card, int method)
+    {
+        if (!card.IsSuppressed)
+            Api.FireTrigger("OnEnterPlay", card, card.Owner,
+                eventArgs: new object?[] { method },
+                namedArgs: new Dictionary<string, object?> { ["Method"] = method },
+                recipientSnapshot: new[] { card }, includeUnavailableRecipients: true);
+        Api.ExecuteOtherCardEnterPlayEvents(card, method);
     }
 
     public GameState State { get; }
@@ -354,8 +387,12 @@ public sealed class MatchEngine
     /// </summary>
     public Func<CardInstance, IReadOnlyList<CardInstance>, CardInstance?>? PickHandTarget { get; set; }
 
+    /// <summary>Replay reply: null means no answer; 0 is an explicit empty-target answer.</summary>
+    public Func<CardInstance, IReadOnlyList<CardInstance>, int?>? PickHandTargetId { get; set; }
+
     /// <summary>
-    /// **bot 决策路径**的「从手牌挑一张」—— 优先级高于 <see cref="PickHandTarget"/>。
+    /// **bot 决策路径**的「从手牌挑一张」—— 优先级高于
+    /// <see cref="PickHandTargetId"/> 和 <see cref="PickHandTarget"/>。
     ///
     /// 用于 `card_unit_gordon_highlanders` 这类卡：
     /// 「Deployment: Choose an order in hand. Set its cost to 0 and put it on top of your deck.」
@@ -459,6 +496,7 @@ public sealed class MatchEngine
 
         State.StartingSide = Side.Left;
         State.ActiveSide = Side.Left;
+        State.SetupSidesInBattle(State.StartingSide, State.StartingSide.Opposite());
         State.Turn = 1;
 
         Api.FireTrigger("OnStartOfGame", null, Side.Left);
@@ -523,6 +561,9 @@ public sealed class MatchEngine
         try
         {
             StartTurnCore(side, draw);
+            // OpponentActionsStartTurn: StartTurnBySide then ExecuteAutoPlayCards.
+            ExecuteAutoPlayCards();
+            ApplyPendingGotchaPlayReceipts();
         }
         finally
         {
@@ -538,6 +579,11 @@ public sealed class MatchEngine
         State.ResetTurnGameplayCounters();
         State.SetHasPlayedWeatherCardThisTurn(false);
         State.ResetDestroyedThisTurn();
+
+        State.ActiveBondFactions.Clear();
+        foreach (var unit in State.Board(side))
+            if (unit.Definition.IsUnit && !CardApi.IsUnrevealedCovertCard(unit))
+                State.ActiveBondFactions.Add(unit.Definition.Faction ?? "");
 
         // ---- kredit 槽位 +1，并回满 ----
         //
@@ -670,6 +716,7 @@ public sealed class MatchEngine
             unit.HasBeenAttackedThisTurn = false;
             unit.HasMovedThisTurn = false;
             unit.AttacksThisTurn = 0;
+            unit.AttackQuotaOffset = 0;
             unit.OperationsUsedThisTurn = 0;
         }
 
@@ -760,6 +807,10 @@ public sealed class MatchEngine
         //    攻击打成「够不着」—— 见 `DecrementPinnedTurnsEndTurn` 的注释。
         DecrementPinnedTurnsEndTurn();
 
+        // OpponentActionsEndTurn i=673 precedes SwitchPlayingSide/IncrementTurnNumber.
+        ExecuteAutoPlayCards();
+        ApplyPendingGotchaPlayReceipts();
+
         RecordAction("XActionEndOfTurn", side, new Dictionary<string, object?>
         {
             ["side"] = side.ToWire(),
@@ -790,7 +841,11 @@ public sealed class MatchEngine
     }
 
     internal void BeginEffectResolution()
-        => _effectResolutionDepth++;
+    {
+        if (_effectResolutionDepth == 0 && _pendingSelections is null)
+            _pendingSelections = new Queue<Action>();
+        _effectResolutionDepth++;
+    }
 
     internal void EndEffectResolution()
     {
@@ -802,6 +857,20 @@ public sealed class MatchEngine
         _effectResolutionDepth--;
         if (_effectResolutionDepth == 0)
         {
+            // A response follows the entire requesting action/Blueprint frame.
+            // Keep a depth while draining: repeated and nested effects append
+            // further responses instead of recursively resolving them inline.
+            _effectResolutionDepth++;
+            try
+            {
+                while (_pendingSelections is { } selections && selections.TryDequeue(out var selection))
+                    selection();
+            }
+            finally
+            {
+                _pendingSelections = null;
+                _effectResolutionDepth--;
+            }
             ConsumePendingForcedEndTurn();
         }
     }
@@ -861,19 +930,56 @@ public sealed class MatchEngine
     /// ⚠️ 2026-09-26 修：**这条检查以前完全不存在**，`DrawCard` 无条件把牌塞进手牌，
     /// 于是手牌能涨到 12 张（NN 对局日志实测），而真实规则是满了直接烧牌。
     /// </summary>
-    public CardInstance? DrawCard(Side side, bool startOfTurnDraw = false)
+    /// <summary>ApplyFatigueDamage: direct HQ defense subtraction, then T26, with a saved death flag.</summary>
+    internal bool ApplyFatigueDamage(Side side, bool fromBond)
+    {
+        var hq = State.Hq(side);
+        int amount = State.Fatigue(side) + 1;
+        int oldDefense = hq.Defense;
+        hq.Defense -= amount;
+        bool destroyed = hq.Defense <= 0;
+        State.SetFatigue(side, amount);
+        FireSubAction("ZActionFatigueDamage", new[]
+        {
+            ActionValue2.Int("cardID", hq.CardId), ActionValue2.Int("damage", amount),
+            ActionValue2.Int("oldDefense", oldDefense), ActionValue2.Bool("destroyed", destroyed),
+            ActionValue2.Bool("fromBond", fromBond),
+        });
+        Api.FireTrigger("OnFatigueDamage", null, side,
+            eventArgs: new object?[] { side, amount, fromBond },
+            namedArgs: new Dictionary<string, object?>
+            { ["sideToApply"] = side, ["fatigueDamage"] = amount, ["fromBond"] = fromBond });
+        return destroyed;
+    }
+
+    public CardInstance? DrawCard(Side side, bool startOfTurnDraw = false, int instigatorId = 0, bool cardSeen = false, bool opponentDraw = false)
+        => DrawCardCore(side, startOfTurnDraw, instigatorId, cardSeen, opponentDraw, null);
+
+    internal CardInstance? DrawSpecificCardFromDeck(Side side, int cardId, int instigatorId, bool cardSeen)
+        => DrawCardCore(side, false, instigatorId, cardSeen, false, cardId);
+
+    private CardInstance? DrawCardCore(Side side, bool startOfTurnDraw, int instigatorId, bool cardSeen, bool opponentDraw, int? selectedCardId)
     {
         var deck = State.Deck(side).ToList();
+        // Specific draw's remove/add-to-top/draw sequence has no callbacks in
+        // between. Select its ID directly while preserving object numbers and
+        // the order of every other deck member. Invalid selection does nothing.
+        var selected = selectedCardId.HasValue ? deck.Find(x => x.CardId == selectedCardId.Value) : null;
+        if (selectedCardId.HasValue && selected is null) return null;
         if (deck.Count == 0)
         {
-            int fatigue = State.Fatigue(side) + 1;
-            State.SetFatigue(side, fatigue);
-            Say($"{side.ToWire()} 牌库空，疲劳伤害 {fatigue}");
-            DamageHq(side, fatigue);
+            if (ApplyFatigueDamage(side, fromBond: false))
+                State.Finish(side.Opposite(), "Victory_DestroyHQ");
             return null;
         }
 
-        var card = deck[0];
+        var card = selected ?? deck[0];
+        // DrawTopCardFromDeck i=62 selects handSide independently of deckSide.
+        Side handSide = opponentDraw ? side.Opposite() : side;
+
+        // DrawTopCardFromDeck i=558 removes membership before i=621 T3;
+        // the object still has its deck location throughout that notification.
+        State.WithDeckCardRemoved(side, card.CardId, () => Api.ExecuteOnAfterDeckChanged(side));
 
         // 「抽**之前**」的手牌数 —— 蓝图 `DrawTopCardFromDeck` i=712 就是在这个时刻
         // （牌已从牌库移除、还没进手牌）取 `FetchCardsByLocation(手牌).QtyInLocation`，
@@ -881,33 +987,47 @@ public sealed class MatchEngine
         // 反证它确实是「抽之前」。
         // ⚠️ 以前这里写的是 `State.Move(...)` **之后**再读 `Hand(side).Count()`，是「抽之后」，
         //    比蓝图多 1（`ZActionDrawCardFromDeck` 的 PreQtyInHand 一直偏大 1）。
-        int preQtyInHand = State.Hand(side).Count();
+        // FetchCardsByLocation excludes current autoplay tags and uses physical
+        // location rather than current owner; query only after the T3 callbacks.
+        int preQtyInHand = Api.CountCardsForHandCapacity(handSide.HandOf());
+
+        List<ActionValue2> DrawValues(bool full)
+        {
+            var values = new List<ActionValue2>
+            {
+                ActionValue2.Int("instigatorID", instigatorId),
+                ActionValue2.Str("side", handSide.ToWire()),
+                ActionValue2.Int("cardID", card.CardId),
+                ActionValue2.Str("cardType", card.Name),
+                ActionValue2.Int("PreQtyInHand", preQtyInHand),
+                ActionValue2.Bool("handIsFull", full),
+            };
+            if (opponentDraw) values.Add(ActionValue2.Bool("oppSide", true));
+            return values;
+        }
 
         // ★ 手牌上限：满了就烧牌，不进手牌。
         if (preQtyInHand >= GameState.HandCapacity)
         {
-            Say($"{side.ToWire()} 手牌已满（{preQtyInHand}/{GameState.HandCapacity}），{card} 被弃掉");
-            State.Move(card, CardLocation.Discard);
-            FireSubAction("ZActionDrawCardFromDeck", new[]
-            {
-                ActionValue2.Int("cardID", card.CardId),
-                ActionValue2.Str("side", side.ToWire()),
-                ActionValue2.Int("PreQtyInHand", preQtyInHand),
-                ActionValue2.Bool("handIsFull", true),
-                ActionValue2.Int("nextFatigueDamage", State.Fatigue(side) + 1),
-            });
+            Say($"{handSide.ToWire()} 手牌已满（{preQtyInHand}/{GameState.HandCapacity}），{card} 被弃掉");
+            // i=772 directly assigns location: no locationNumber write,
+            // discard rearrangement or CardLocationMoved notification.
+            card.Location = CardLocation.Discard;
+            card.RecalculateStats();
+            FireSubAction("ZActionDrawCardFromDeck", DrawValues(true));
+            // DrawTopCardFromDeck i=1194/1204 runs even on the full-hand path.
+            if (cardSeen) Api.SetCardSeen(card.CardId, 0);
             return null;
         }
 
-        State.Move(card, side.HandOf());
-        FireSubAction("ZActionDrawCardFromDeck", new[]
-        {
-            ActionValue2.Int("cardID", card.CardId),
-            ActionValue2.Str("side", side.ToWire()),
-            ActionValue2.Int("PreQtyInHand", preQtyInHand),
-            ActionValue2.Bool("handIsFull", false),
-            ActionValue2.Int("nextFatigueDamage", State.Fatigue(side) + 1),
-        });
+        // i=1042..1140 changes current side on successful receipt only;
+        // OriginalOwner is preserved, and the full-hand branch never changes it.
+        State.ChangeOwner(card, handSide, normalize: false);
+        // DrawTopCardFromDeck i=712/1042 assigns the count, without rearranging existing hand cards.
+        // i=1042..1189 directly writes fields: no CardLocationMoved helper.
+        State.Move(card, handSide.HandOf(), locationNumber: preQtyInHand,
+            notifyMoved: false, normalizeLocation: false);
+        FireSubAction("ZActionDrawCardFromDeck", DrawValues(false));
 
         // 「别的卡被抽到手」触发点。**必须接**：`card_unit_85_pioneer_company` /
         // `card_unit_big_red_one` / `card_event_committed_crew` 三张光环都订阅它，
@@ -925,14 +1045,21 @@ public sealed class MatchEngine
         // `broadcast` 判定（`programName.StartsWith("OnOther")`）会**把主体自己排除**，
         // 兜底那一段又被 `subjectBroadcast` 挡住 ⇒ 22 张订阅 `OnCardDrawnFromDeck`
         // 的卡永远收不到（`card_event_guarilla_warfare_school` 这类"抽到牌时"效果全死）。
-        FireEnteredHandFromDeckEvents(card, side, startOfTurnDraw);
+        FireEnteredHandFromDeckEvents(card, handSide, startOfTurnDraw);
+        // DrawTopCardFromDeck i=1329..1474 checks the live tag after own/T42
+        // events, then AddAutoPlayCards preserves first-insertion order by ID.
+        // Consumption belongs to the outer action boundary, not this draw.
+        if (CardApi.HasInstanceGameplayTag(card, "autoplay")) State.AddAutoPlayCards(card.CardId);
+        // i=819 pushes the reveal continuation at i=1194, but i=1013 first
+        // jumps to the own/T42 events at i=1274. Reveal runs after those events.
+        // False is a no-op, not a request to clear existing revealed state.
+        if (cardSeen) Api.SetCardSeen(card.CardId, 0);
         return card;
     }
 
     /// <summary>
-    /// 派发一张牌从牌库进入手牌时的两个客户端触发点。
-    /// 回放驱动在牌序不一致时也会把动作引用的牌从牌库硬塞进手牌，
-    /// 那条路径必须复用同一组事件，否则手牌光环和抽牌触发会缺失。
+    /// ExecuteOnDrawnFromDeck：有效对象先执行自身事件，再查询 T42。
+    /// 此阶段不额外限制对象位置；是否进入该阶段由各抽牌入口决定。
     /// </summary>
     public void FireEnteredHandFromDeckEvents(CardInstance card, Side side, bool startOfTurnDraw)
     {
@@ -945,11 +1072,132 @@ public sealed class MatchEngine
 
         Api.FireTrigger("OnCardDrawnFromDeck", card, side,
             eventArgs: new object?[] { startOfTurnDraw, (int)side },
-            eventSubject: card, namedArgs: drawnNamed);
+            // ExecuteOnDrawnFromDeck i=89/118 validates the object only;
+            // i=132 directly invokes it regardless of location/suppression.
+            eventSubject: card, namedArgs: drawnNamed, includeUnavailableRecipients: true);
 
-        Api.FireTrigger("OnOtherCardDrawnFromDeck", card, side,
-            eventArgs: new object?[] { card.CardId, startOfTurnDraw, (int)side },
-            eventSubject: card, namedArgs: drawnNamed);
+        Api.ExecuteOtherCardDrawnEvents(card, side, startOfTurnDraw);
+    }
+
+    private readonly Queue<(int CardId, bool PlayedDirectly)> _pendingGotchaPlayReceipts = new();
+
+    /// <summary>Apply the rule-bearing Gotcha part of local ReceiveActionPlayCardFromHand.</summary>
+    public void ApplyPendingGotchaPlayReceipts()
+    {
+        while (_pendingGotchaPlayReceipts.TryDequeue(out var receipt))
+        {
+            var card = State.ById(receipt.CardId);
+            if (card is null || !Api.IsGotcha(card)) continue;
+            // i=1294/1308: local direct-play notifications must not toggle twice.
+            if (receipt.PlayedDirectly) continue;
+            if (card.GotchaActivated > 0) card.GotchaActivated = 0;
+            else
+            {
+                // i=3602..3762 reads current cost, not the cost at notification time.
+                Api.JsonSetInt(card, "kreditsPayed", card.KreditCost);
+                int next = 0;
+                foreach (var other in State.AllCards)
+                    if (Api.IsGotcha(other) && other.Owner == card.Owner && other.GotchaActivated > next)
+                        next = other.GotchaActivated;
+                // The receive function has no hand-location filter.
+                card.GotchaActivated = next + 1;
+            }
+        }
+    }
+
+    private void NotifyPlayFromHand(CardInstance card, int instigatorId,
+        int locationNumber, int targetId, bool playedDirectly, CardLocation? destination = null)
+    {
+        Effects.Blueprint.LiveRuleTables.TryGetEnumName("/Script/kards.ECardLocationEnum",
+            (int)(destination ?? card.Location), out string locationName);
+        var values = new List<ActionValue2>
+        {
+            ActionValue2.Int("cardID", card.CardId),
+            ActionValue2.Int("instigatorID", instigatorId),
+            ActionValue2.Str("location", locationName),
+            ActionValue2.Int("locationNumber", locationNumber),
+            ActionValue2.Int("enterPlayOnTurn", State.Turn),
+            ActionValue2.Int("targetCardID", targetId),
+            ActionValue2.Int("nonVisualLocationNumber", locationNumber),
+        };
+        // Direct function passes chooseOneIndex=0; normal Gotcha has no choices.
+        if (playedDirectly)
+        {
+            values.Add(ActionValue2.Int("chooseOneIndex", 0));
+            values.Add(ActionValue2.Bool("playedDirectly", true));
+        }
+        FireSubAction("ZActionPlayCardFromHand", values);
+        if (Api.IsGotcha(card)) _pendingGotchaPlayReceipts.Enqueue((card.CardId, playedDirectly));
+    }
+
+    private bool _processingAutoPlayCards;
+
+    /// <summary>Process autoplay rules; action boundaries apply local Gotcha receipts afterwards.</summary>
+    public void ExecuteAutoPlayCards()
+    {
+        if (_processingAutoPlayCards) return;
+        _processingAutoPlayCards = true;
+        try
+        {
+            for (int index = 0; ; index++)
+            {
+                // Native i=157/345/542/797 re-reads the queue throughout the loop.
+                var ids = State.GetAutoPlayCards();
+                if (index >= ids.Length) break;
+                var card = State.ById(ids[index]);
+                if (card is null || card.Location is not (CardLocation.HandLeft or CardLocation.HandRight)) continue;
+                ApplyNativeHandPlayCost(card);
+                // PlayCardFromHand i=921/962/976 returns for Gotcha after cost
+                // and play notification. It does not toggle activation or move it.
+                // Gotcha records a notification; receipt application is a later batch stage.
+                if (Api.IsGotcha(card))
+                {
+                    NotifyPlayFromHand(card, card.CardId, 0, 0, playedDirectly: false);
+                    continue;
+                }
+                PlayCardFromHandCore(card, target: null, skipLeaveTrigger: false,
+                    chargeKredits: false,
+                    recordAction: false, toFrontline: false, locationNumber: 0,
+                    instigatorID: card.CardId);
+            }
+            State.ClearAutoPlayCards();
+        }
+        finally { _processingAutoPlayCards = false; }
+    }
+
+    private void ApplyNativeHandPlayCost(CardInstance card, CardInstance? target = null)
+    {
+        // PlayCardFromHand i=61..304: the activation field alone selects refund,
+        // and neither normal cost nor the autoplay tag is checked on that path.
+        if (card.GotchaActivated > 0)
+        {
+            ChangeHandPlayKredits(card, Api.JsonGetInt(card, "kreditsPayed"));
+            return;
+        }
+        if (CardApi.HasInstanceGameplayTag(card, "autoplay")) return;
+        int cost = GetPlayCardCost(card, target);
+        // PayCardCost does not partially deduct on failure. Its caller ignores
+        // success, so the subsequent play flow still runs.
+        if (cost <= State.Kredits(card.Owner)) ChangeHandPlayKredits(card, -cost);
+    }
+
+    private void ChangeHandPlayKredits(CardInstance card, int delta)
+    {
+        int old = State.Kredits(card.Owner);
+        int slots = State.MaxKredits(card.Owner);
+        // ChangeKreditsBySide clamps current kredits to the maximum possible,
+        // not to the side's current slots (native getter reads game-state +0x338).
+        int current = Math.Clamp(old + delta, 0, MaxKreditCap);
+        State.SetKredits(card.Owner, current);
+        FireSubAction("ZActionChangeKredits", new[]
+        {
+            ActionValue2.Int("triggerCardID", card.CardId),
+            ActionValue2.Str("side", card.Owner.ToWire()),
+            ActionValue2.Int("newMaxKredits", slots),
+            ActionValue2.Int("oldMaxKredits", slots),
+            ActionValue2.Int("newKredits", current),
+            ActionValue2.Int("oldKredits", old),
+        });
     }
 
     // ==================== 部署 ====================
@@ -1034,6 +1282,10 @@ public sealed class MatchEngine
             return false;
         }
 
+        // BP_Logic.CanPlayCardFromHand i=56..234 handles weather; i=468..717
+        // checks affordability before invoking the card-local blocker at i=731.
+        if (Api.IsBlockedFromPlay(card, out reason)) return false;
+
         if (card.Definition.IsOrder && State.HasGameplayRestriction(card.Owner,
             GameplayRestrictionType.CannotPlayOrders))
         {
@@ -1054,6 +1306,16 @@ public sealed class MatchEngine
             return false;
         }
 
+        // BP_Logic.CanPlayCardFromHand i=1400: an order without a target
+        // requirement skips enumeration; otherwise i=1482..2618 must find a
+        // candidate passing its own and common target checks.
+        if (card.Definition.IsOrder && card.SelectTargetOnPlayedFromHand
+            && !Api.HasPlayableOrderTarget(card))
+        {
+            reason = "no_legal_play_target";
+            return false;
+        }
+
         return true;
     }
 
@@ -1066,10 +1328,10 @@ public sealed class MatchEngine
     {
         if (target is null || target.Owner == card.Owner || target.KreditsTaxAsEnemyTarget <= 0)
         {
-            return card.KreditCost;
+            return card.TotalKreditCost;
         }
 
-        return card.KreditCost + target.KreditsTaxAsEnemyTarget;
+        return card.TotalKreditCost + target.KreditsTaxAsEnemyTarget;
     }
 
     /// <summary>
@@ -1098,9 +1360,39 @@ public sealed class MatchEngine
     /// </param>
     public bool PlayCard(CardInstance card, CardInstance? target = null, bool skipLeaveTrigger = false)
     {
+        BeginEffectResolution();
+        try
+        {
+            bool completed = PlayCardActionCore(card, target, skipLeaveTrigger);
+            if (completed)
+            {
+                ExecuteAutoPlayCards();
+                ApplyPendingGotchaPlayReceipts();
+            }
+            return completed;
+        }
+        finally { EndEffectResolution(); }
+    }
+
+    private bool PlayCardActionCore(CardInstance card, CardInstance? target, bool skipLeaveTrigger)
+    {
         if (!CanPlay(card, out string reason, target))
         {
             return false;
+        }
+
+        if (Api.IsGotcha(card))
+        {
+            RecordAction("XActionPlayCardFromHand", card.Owner, new Dictionary<string, object?>
+            {
+                ["cardID"] = card.CardId,
+                ["location"] = "Hand",
+                ["side"] = card.Owner.ToWire(),
+            });
+            ApplyNativeHandPlayCost(card, target);
+            NotifyPlayFromHand(card, card.CardId, card.LocationNumber, target?.CardId ?? 0,
+                playedDirectly: false);
+            return true;
         }
 
         return PlayCardFromHandCore(card, target, skipLeaveTrigger,
@@ -1111,10 +1403,8 @@ public sealed class MatchEngine
     /// <summary>
     /// 蓝图 <c>PlayCardDirectlyFromHand</c> 的免费/特殊出牌路径。
     ///
-    /// 这条原语不经过普通出牌的行动方、费用和半场容量门；调用方可能正在
-    /// 结算另一张牌，甚至直接打出另一方手牌中的牌。它仍然复用完整的
-    /// CardPlayedFromHand 触发链，保证战吼、旁观触发、部署倍增、Alpine 和
-    /// 死亡检查的顺序与普通出牌一致。
+    /// Gotcha 在手牌中只切换激活号，然后提前返回，不经过普通打牌链。
+    /// 非 Gotcha 只经过位置移动及Method=2入场事件，不执行普通手牌打牌链。
     /// </summary>
     public bool PlayCardDirectlyFromHand(CardInstance card, bool toFrontline,
                                          int instigatorID, int locationNumber)
@@ -1124,9 +1414,68 @@ public sealed class MatchEngine
             return false;
         }
 
-        return PlayCardFromHandCore(card, target: null, skipLeaveTrigger: false,
-            chargeKredits: false, recordAction: false, toFrontline,
-            locationNumber, instigatorID);
+        if (Api.IsGotcha(card))
+        {
+            // PlayCardDirectlyFromHand i=271..441/1652..2632 toggles the
+            // activation, preserves the hand location/number, then i=853/908
+            // returns before CardLocationMoved and enter-play effects.
+            Api.AssignGotchaActivatedOnPlayFromHand(card);
+            NotifyPlayFromHand(card, instigatorID, card.LocationNumber,
+                card.BlueprintVariables.GetValueOrDefault("targetOverride") is CardInstance overrideTarget ? overrideTarget.CardId : 0,
+                playedDirectly: true);
+            return true;
+        }
+
+        CardLocation destination = toFrontline ? CardLocation.BoardFrontline : card.Owner.HqOf();
+        int count = State.CardsUnordered().Count(x => x.Location == destination);
+        int capacity = toFrontline ? State.FrontlineCapacity : GameState.HalfBoardCapacity;
+        if (count >= capacity || toFrontline && Api.DoesSideControlTheFrontline(card.Owner.Opposite()))
+        {
+            // i=1260/1391 -> i=1302: source=0, skipSubAction=false, ForceDiscard=true.
+            Api.ForceDiscardHandCardForBlockedDirectPlay(card);
+            return false;
+        }
+
+        BeginEffectResolution();
+        try
+        {
+            var oldLocation = card.Location;
+            int slot = locationNumber >= 0 ? locationNumber : count;
+            int targetId = card.BlueprintVariables.GetValueOrDefault("targetOverride") is CardInstance directTarget
+                ? directTarget.CardId : 0;
+            // i=757 notifies before i=2809 moves. This path never calls CardPlayedFromHand.
+            NotifyPlayFromHand(card, instigatorID, slot, targetId, playedDirectly: true, destination);
+            Api.SetHandEdgesWhenPlayed(card);
+            // InjectCardIntoLocation: create a gap, then RefreshLocationStatus
+            // compacts both physical locations before movement callbacks.
+            foreach (var other in State.CardsUnordered().Where(x => x.Location == destination))
+                if (other.LocationNumber >= slot) other.LocationNumber++;
+            State.Move(card, destination, slot, moveReason: CardMoveReason.PlayCardForce,
+                notifyMoved: false, normalizeLocation: false);
+            Effects.Blueprint.LiveRuleTables.TryGetEnumName("/Script/kards.ECardLocationEnum", (int)oldLocation, out string oldName);
+            Effects.Blueprint.LiveRuleTables.TryGetEnumName("/Script/kards.ECardLocationEnum", (int)destination, out string newName);
+            Effects.Blueprint.LiveRuleTables.TryGetEnumName("/Game/Structs/CardMoveReason.CardMoveReason",
+                (int)CardMoveReason.PlayCardForce, out string reasonName);
+            FireSubAction("ZActionMoveCardToNewLocation", new[] {
+                ActionValue2.Int("cardID", card.CardId), ActionValue2.Int("instigatorID", instigatorID),
+                ActionValue2.Str("oldLocation", oldName), ActionValue2.Str("newLocation", newName),
+                ActionValue2.Int("newLocationNumber", slot), ActionValue2.Int("nonVisualLocationNumber", slot),
+                ActionValue2.Str("moveReason", reasonName),
+                ActionValue2.Int("attackLeft", card.RemainingAttacks),
+                ActionValue2.Int("movementLeft", card.HasMovedThisTurn ? 0 : 1),
+            });
+            Api.RefreshLocationStatus(new[] { oldLocation, destination });
+            State.CardMoved?.Invoke(card, oldLocation, destination, false, CardMoveReason.PlayCardForce);
+            // Follow the execution-flow stack: clear/persist -> fields -> entry -> Alpine.
+            if (Api.JsonClear(card, "countdown_timer")) Api.PersistCustomFields(card);
+            card.EnteredPlayOnTurn = State.Turn;
+            card.KreditCost = card.IsSalvaged ? Math.Min(3, card.Definition.Kredits) : card.Definition.Kredits;
+            card.CardSeen = false;
+            ExecuteOnEnterPlayEvents(card, 2);
+            if (card.Keywords.Contains(Keyword.Alpine)) Api.GiveAlpineBonus(card);
+            return true;
+        }
+        finally { EndEffectResolution(); }
     }
 
     private bool PlayCardFromHandCore(CardInstance card, CardInstance? target,
@@ -1161,10 +1510,7 @@ public sealed class MatchEngine
             State.AddKredits(card.Owner, -GetPlayCardCost(card, target));
         }
 
-        // PlayCardDirectlyFromHand in BP_CardFunctions assigns activation
-        // numbers to Gotcha cards before the play broadcast. Normal play and
-        // direct play share the same activation state in the client.
-        Api.AssignGotchaActivatedOnPlayFromHand(card);
+        // Gotcha uses separate processing/receipt branches before this common path.
 
         if (recordAction)
         {
@@ -1192,6 +1538,49 @@ public sealed class MatchEngine
             FireLeaveTrigger(card, CardLocation.BoardFrontline);
         }
 
+        // PlayCardFromHand i=1988 -> CardPlayedFromHand i=2114.
+        if (card.Definition.IsUnit || card.Definition.IsLocationCard)
+        {
+            PlaceOnBoard(card, toFrontline, locationNumber,
+                chargeKredits ? CardMoveReason.PlayCardPlayerMove : CardMoveReason.PlayCardForce);
+        }
+        else
+        {
+            // 指令牌：先进弃牌堆再结算（游戏里指令是"用完即弃"，
+            // 结算期间它已经不在手牌里了）
+            State.Move(card, CardLocation.Discard, moveReason:
+                chargeKredits ? CardMoveReason.PlayCardPlayerMove : CardMoveReason.PlayCardForce);
+        }
+
+        // 「本回合进场的回合数」——**指令也要记**。
+        // 卡蓝图里的实例变量 `enterPlayOnTurn` 就是它，实测
+        // `card_event_committed_crew` 的每个分支都先判 `enterPlayOnTurn > 0`
+        // （"这张牌是不是本回合打出的"）—— 只有单位记的话，指令类光环
+        // （committed_crew 自己就是 10 费指令）会全部静默失效。
+        // `PlaceOnBoard` 里也会设一次，值相同，重复设没有副作用。
+        card.EnteredPlayOnTurn = State.Turn;
+
+        if (card.Name is "card_event_sunny1_blue_sky" or "card_event_rain1_mist" or "card_event_storm1_gale")
+            Api.RunCardEffect(card, target);
+        State.StopFurtherActions = false;
+        var cardsDone = new HashSet<int>();
+        var afterPlayGotchas = new List<CardInstance>();
+        foreach (int id in Api.GetActiveGotchasOrdered())
+        {
+            if (State.StopFurtherActions) return true;
+            if (State.ById(id) is not { } gotcha) continue;
+            if (CardApi.CustomNameHasAttribute(gotcha, "customName1", "gotchaAfterPlayFromHand"))
+                afterPlayGotchas.Add(gotcha);
+            else
+            {
+                Api.FireTrigger("OnOtherCardPlayedFromHand", gotcha, gotcha.Owner,
+                    selfProgramName: "OnOtherCardPlayedFromHand", eventSubject: card,
+                    namedArgs: new Dictionary<string, object?> { ["cardPlayed"] = card });
+                cardsDone.Add(id);
+            }
+        }
+        if (State.StopFurtherActions) return true;
+
         // ---- 未揭示隐蔽牌的专用触发点 ----
         //
         // 蓝图 `CardPlayedFromHand` 的顺序是：先由出牌卡自己收到
@@ -1217,7 +1606,7 @@ public sealed class MatchEngine
         // 触发号 19 的依据：`ERegisteredCardFunction.h` 逐项数下来第 20 项
         //   = `OnBeforeOtherCardPlayedFromHand`。
         // 签名 `BaseCardObject.h:739`。**没有"自己"那一路** —— 39 张订阅者全是别人。
-        // 时机：在卡离手/落场**之前**（蓝图的 `CardPlayedFromHand` 开头段就是这里）。
+        // PlayCardFromHand moves the card before CardPlayedFromHand callbacks.
         // ⚠️ 必须显式 `broadcastName: true`：这个名字以 `OnBefore` 开头、不是 `OnOther`，
         //    靠命名约定判广播会把它当成"只发给主体" ⇒ 39 张订阅者全部收不到。
         Api.FireTrigger("OnBeforeOtherCardPlayedFromHand", card, card.Owner,
@@ -1229,40 +1618,16 @@ public sealed class MatchEngine
             },
             broadcastName: true);
 
-        // ---- ① 先离开手牌，再结算效果 ----
-        //
-        // ⚠️ 顺序**不能反**，这是从 `ref/kards-sim` 的可运行实现里逐行确认的
-        //    （`GameEngine.Actions.cs` 的 `DoPlayCard`）：
-        //        p.Hand.RemoveAt(...)          ← 先离手
-        //        if (c.IsOrder) PlayOrder(c);  ← 再结算指令
-        //        else { c.Loc = Board; ... }   ← 单位先落场
-        //        FirePlayTriggers(c); FireEnterPlayTriggers(c);
-        //        RunCardEffect(c, OnPlayedFromHand);   ← 最后才是战吼
-        //
-        //    旧实现是「先结算效果、后离手」，会踩两个坑：
-        //    (a) 指令结算时**还带着手牌身份**，`card_unit_85_pioneer_company`
-        //        这类只作用于「手牌里的牌」的光环会在结算过程中把刚打出的那张
-        //        重新 buff 一遍；
-        //    (b) 光环的还原分支判 `IsLocatedOnBoard(刚打出的牌)`（真机里这条判据
-        //        对指令也成立），「先结算后离手」时判据必然为假 → 永不还原。
-        if (card.Definition.IsUnit || card.Definition.IsLocationCard)
+        // CardPlayedFromHand i=1539..2066: Bond uses the start-turn snapshot,
+        // then ordinary Cipher reveals cards before entry/deployment.
+        if (CardApi.HasBond(card) && !State.ActiveBondFactions.Contains(card.Definition.Faction ?? "")
+            && ApplyFatigueDamage(card.Owner, fromBond: true))
         {
-            PlaceOnBoard(card, toFrontline, locationNumber);
+            State.Finish(card.Owner.Opposite(), "Victory_DestroyHQ");
+            return true;
         }
-        else
-        {
-            // 指令牌：先进弃牌堆再结算（游戏里指令是"用完即弃"，
-            // 结算期间它已经不在手牌里了）
-            State.Move(card, CardLocation.Discard);
-        }
-
-        // 「本回合进场的回合数」——**指令也要记**。
-        // 卡蓝图里的实例变量 `enterPlayOnTurn` 就是它，实测
-        // `card_event_committed_crew` 的每个分支都先判 `enterPlayOnTurn > 0`
-        // （"这张牌是不是本回合打出的"）—— 只有单位记的话，指令类光环
-        // （committed_crew 自己就是 10 费指令）会全部静默失效。
-        // `PlaceOnBoard` 里也会设一次，值相同，重复设没有副作用。
-        card.EnteredPlayOnTurn = State.Turn;
+        if (card.Cipher > 0 && !Api.IsGotcha(card))
+            Api.SetCardsSeenByCipher(card.Cipher, card.CardId, card.Owner);
 
         // ---- ② 本回合打出过的牌 ----
         // 放在 `OnEnterPlay` **之前**：光环的 `anyOrderPlayedThisTurn` 是
@@ -1270,146 +1635,83 @@ public sealed class MatchEngine
         // 自己的进场时机 —— 它自己当然算"已经打出"。
         State.CardsPlayedThisTurn.Add(card);
 
-        // Blueprint trigger queries materialize their recipient lists before
-        // the played card's own effect. Keep that membership stable even
-        // while retaining the replay-validated dispatch timing below.
-        var playedCardTriggerSnapshot = Api.CaptureTriggerSnapshot();
+        // T51 then T43 are captured before deployment; each unique recipient
+        // receives both callbacks after deployment (i=2080/2132 -> i=6750/6795).
+        var triggerCards = Api.CaptureTriggerSnapshot().ToArray();
+        var playedCardTriggerSnapshot = triggerCards
+            .Where(x => x.Definition.IsRegisteredFor("OnOtherCardPlayedFromHand"))
+            .Concat(triggerCards.Where(x => x.Definition.IsRegisteredFor("OnOtherCardEnterPlay")))
+            .ToArray();
+        Api.FireTrigger("OnEnterPlay", card, card.Owner,
+            eventArgs: new object?[] { 1 },
+            namedArgs: new Dictionary<string, object?> { ["Method"] = 1 });
 
-        // ---- ③ 进场触发点（**只发这张卡自己的 `OnEnterPlay`**）----
-        //
-        // ⚠️ 2026-10-03：原先这里把「自己那一路 `OnEnterPlay`」和「广播 `OnOtherCardEnterPlay`」
-        //    塞进**同一次** `FireTrigger`（靠第 4 个实参 `otherProgramName` 一起发）。
-        //    拆开的理由是广播那一路的位置错了 —— 见下面 ⑤ 的注释（蓝图 :6464）。
-        //    拆开**不改变**自己那一路的时机：蓝图 `OnEnterPlay(cardPlayed, 1)` 在
-        //    `:6179`（L_0DAD），排在 `otherCards` 那一轮循环（`:6462/:6464`）**之前**。
-        Api.FireTrigger("OnEnterPlay", card, card.Owner, eventArgs: new object?[] { card, 0 });
+        void ContinuePlay(bool waited)
+        {
+            // AfterWait uses the current active gotchas and the pre-deployment
+            // T51/T43 snapshot. Immediate play uses the captured after-play list.
+            if (waited) State.StopFurtherActions = false;
+            IEnumerable<CardInstance> gotchas = waited
+                ? Api.GetActiveGotchasOrdered().Select(State.ById).OfType<CardInstance>()
+                : afterPlayGotchas;
+            if (waited)
+            {
+                gotchas = gotchas.ToArray();
+                foreach (var gotcha in gotchas)
+                    if (!CardApi.CustomNameHasAttribute(gotcha, "customName1", "gotchaAfterPlayFromHand"))
+                        cardsDone.Add(gotcha.CardId);
+            }
+            foreach (var observer in gotchas.Concat(playedCardTriggerSnapshot))
+            {
+                if (State.StopFurtherActions) break;
+                if (!cardsDone.Add(observer.CardId)) continue;
+                Api.FireTrigger("OnOtherCardPlayedFromHand", observer, observer.Owner,
+                    selfProgramName: "OnOtherCardPlayedFromHand", eventSubject: card,
+                    eventArgs: new object?[] { card },
+                    namedArgs: new Dictionary<string, object?> { ["cardPlayed"] = card });
+                Api.FireTrigger("OnOtherCardEnterPlay", observer, observer.Owner,
+                    selfProgramName: "OnOtherCardEnterPlay", eventSubject: card,
+                    eventArgs: new object?[] { card, 1 },
+                    namedArgs: new Dictionary<string, object?> { ["cardPlayed"] = card, ["Method"] = 1 });
+            }
+            Api.GiveAlpineBonus(card);
+        }
 
-        // ---- ④ 部署 / 战吼 ----
-        //
-        // 蓝图 `BP_CardFunctions::CardPlayedFromHand` 把「战吼」拆成两条路
-        // （`si=3640 JumpIfNot 5840 cond=cardPlayed.hasDeployment`）：
-        //   · 没有 `hasDeployment`（**全部 732 张指令** + 21 张没有该字段的单位）
-        //     → si=5840 处 `_triggerMultiple` 恒为 0，落到 si=6114 **跑一次** OnPlayedFromHand。
-        //   · 有 `hasDeployment`（249 张单位）→ 事件 14 取消钩子 → 事件 23 取 triggerMultiple
-        //     → OnPlayedFromHand 跑 `1 + triggerMultiple` 次。
-        // 两条路在「不取消、不翻倍」时**完全一样**，所以旧实现（无条件跑一次）对绝大多数
-        // 对局是对的；差别只在取消与翻倍。见 `RunDeploymentEffect` 的注释。
-        // ---- ⑤「别的卡从手牌被打出」----
-        // 这一条以前**根本没接**，所以 card_unit_85_pioneer_company /
-        // card_event_committed_crew 的 OnOtherCardPlayedFromHand 分支
-        // （就是它们还原 buff / 给部署单位加成的那一支）从来没执行过。
-        //
-        // ⚠️⚠️ **接收者必须在前面快照；当前回放验证过的广播时序仍在
-        //    `RunDeploymentEffect` 之前**。
-        //
-        // 蓝图 `BP_CardFunctions.g.cs:5827 CardPlayedFromHand` 的语句序是：
-        //   :6060  取触发点 51（`OnOtherCardPlayedFromHand`，`Core/Trigger.g.cs:61`）
-        //   :6142  记录这批接收者；偏移顺序与回放行为目前尚未闭合。
-        // 当前内核保留回放验证过的「广播 → 自身效果」顺序，同时使用早快照。
-        //   `ref/kards-sim/KardsSim/Bridge/GameEngine.Actions.cs:429 FirePlayTriggers(c)`
-        //   在 `:448 Host.PlayCardFromHand(c, …)` **之前**
-        //   （`GameEngine.Triggers.cs:50` 注明「顺序照客户端 `CardPlayedFromHand` 的编排」）。
-        //
-        // 旧实现虽然曾把广播提前，但没有保留早快照；动态扫描会让新生成卡错误收到本次广播。
-        // 后果实测（回放 854099 `#49 t11`，人类打 `card_event_night_raid`）：
-        //   该指令的效果 `SpawnCardOnBattlefield(…, "card_unit_commandos", …)` 生成 `#11002` 到半场；
-        //   因为广播排在后面，**这个刚生成的单位已经落场**，于是收到了本该只发给"**别人**"的广播
-        //   —— 它自己的 `OnOtherCardPlayedFromHand`（`card_unit_commandos.g.cs:36-59`：
-        //   `IsLocatedOnBoard && IsOrder && faction==2 && side==self.side`
-        //   → `GetCardsOnBoardBySide(敌)` → **`GetRandomCard`** → `DamageCard(1)`）就执行了
-        //   ⇒ **多消费 1 个随机数**（`--rng-trace` 实测 `#39 GetRandomCard n=3 idx=1`），
-        //   并把对方的 `#66`(1/1) 打死。
-        // ⇒ 连锁：`#54 t13` 客户端用 `#66` 打 `#39`、内核已把 `#66` 丢掉 ⇒ 拒打
-        //   ⇒ **客户端 `#39` 死、内核 `#39` 活** ⇒ 内核半场虚高 1
-        //   ⇒ `#70 t15` 假「半场已满」（`#77/#79/#83/#90/#92/#102/#104/#109/#111/#116` 全是连锁）；
-        //   随机游标也从 `#49` 起超前 1（审计 ④ 首条人类 HQ 失配 `#60 t13 期望 19 实际 20`）。
-        // ---- ⑤b 广播：`OnOtherCardEnterPlay`（触发号 43）----
-        //
-        // ⚠️⚠️ 2026-10-03：**同一张旁观卡必须 T51 在前、T43 在后**（旧实现反了）。
-        // 蓝图 `CardPlayedFromHand` 把两个触发点取到后 Append 进**同一个** `otherCards`：
-        //   :6060  otherCards = FetchAllCardsWithEventTrigger(51)
-        //   :6064  tmp       = FetchAllCardsWithEventTrigger(43)
-        //   :6066  Array_Append(otherCards, tmp)
-        // 然后那一轮循环里对**同一张卡**：
-        //   :6462  OnOtherCardPlayedFromHand(_tmpOtherCard, cardPlayed)   ← T51 先
-        //   :6464  OnOtherCardEnterPlay(_tmpOtherCard, cardPlayed, 1)     ← T43 后
-        //   :6466  cardsDone.Add(_tmpOtherCard.cardID)
-        // 订阅这两个触发点的交集只有 4 张（card_brawl_test1 / card_location_british_scen5 /
-        // card_unit_269th_rifles / card_unit_kv_1s），自测 `PlayCardOtherTriggersOrder` 直接守它。
-        //
-        // 两个广播都使用上面保存的早快照；同一张旁观卡仍保持 T51 在 T43 之前。
-        // ⚠️ 用 `programName = "OnOtherCardEnterPlay"`（而不是 `otherProgramName`）：
-        //    它的 `OnOther` 前缀让 `FireTrigger` 直接走广播分支，**不会**顺带把
-        //    `OnEnterPlay` 再发给主体一次（那会变成自己那一路发两遍）。
-        // The early recipient snapshot prevents a newly spawned card from
-        // observing this action's broadcast.  Replay evidence currently
-        // requires these broadcasts before the deployment effect; moving them
-        // after the effect regresses 854099 by seven human actions.
-        using var playedBroadcast = Api.BeginPlayedCardBroadcast(card.CardId);
-        Api.FireTrigger("OnOtherCardPlayedFromHand", card, card.Owner,
-            eventArgs: new object?[] { card }, recipientSnapshot: playedCardTriggerSnapshot);
-        Api.FireTrigger("OnOtherCardEnterPlay", card, card.Owner,
-            eventArgs: new object?[] { card, 0 }, recipientSnapshot: playedCardTriggerSnapshot);
+        // CardPlayedFromHand runs the Pincer relation after OnEnterPlay and
+        // before the card's own OnPlayedFromHand (si=4561..4728).  Deployment
+        // cancellation takes this branch too; it only bypasses the own effect.
+        if (card.Keywords.Contains(Keyword.Pincer) && target is not null)
+            Api.ApplyPincerEffects(card, target);
 
-        // `AddToTriggerQueue` later invokes this card's own OnPlayedFromHand
-        // with the target captured at the original play time.
+        // CardPlayedFromHand sets ExecuteWaitPlayFromHand before invoking the
+        // card's own effect. A one-card selection resolves inside that effect,
+        // so registering this continuation afterwards leaves a stale wait.
         card.CurrentTarget = target;
-        RunDeploymentEffect(card, target);
+        bool waitsForTarget = card.Definition.WaitForHandTarget;
+        if (waitsForTarget)
+            _waitPlayContinuations[card.CardId] = () => ContinuePlay(waited: true);
+        cardsDone.Add(card.CardId);
 
-        // ---- ⑥ 山地加成（`GiveAlpineBonus`）----
-        //
-        // 出处 `out/bp-cardfn.json` → `PlayCardFromHand`（105 条语句）：
-        // <code>
-        // si=2114  CardPlayedFromHand(tmpCardToPlay, targetCardID)   ; 上面 ①..⑤ 全在这里面
-        // si=2147  GameStateRef.GetExecuteWaitPlayFromHand(out ShouldExecuteWait)
-        // si=2192  JumpIfNot(ShouldExecuteWait) -> si=2207
-        // si=2207      GiveAlpineBonus(tmpCardToPlay)
-        // </code>
-        // ⇒ ①「**没走 wait 路径**才在这里给」，走 wait 路径的由
-        //    `AfterWaitCardPlayFromHand` si=974 自己给（两条互斥，不会双给）；
-        //    ② 时机是 **`CardPlayedFromHand` 整条跑完之后**，所以放在这里而不是 `PlaceOnBoard` 里。
-        // ⚠️ 加成是**加法**（`changeType=1`），一个单位只能给一次 —— 见 `GiveAlpineBonus` 的注释。
-        Api.GiveAlpineBonus(card);
+        bool effectExecuted = RunDeploymentEffect(card, target);
+
+        if (!waitsForTarget || !effectExecuted)
+        {
+            _waitPlayContinuations.Remove(card.CardId);
+            ContinuePlay(waited: false);
+        }
+        // The inline singleton/empty-selection paths already consumed the
+        // continuation. Multiple-choice paths retain it for the queued reply.
 
         CheckDeaths();
         return true;
     }
 
     /// <summary>
-    /// 部署链 —— 蓝图 <c>BP_CardFunctions::CardPlayedFromHand</c> 的 si=3640..6434。
-    ///
-    /// **这是「一个机制」，不是「249 张卡各写各的」。** 249 张 `hasDeployment` 卡的
-    /// 部署文本各自写在**那张卡自己的 `OnPlayedFromHand`** 里；引擎侧只有这一条链：
-    /// 门 → 取消钩子（事件 14）→ 取翻倍数（事件 23）→ 跑 `1 + triggerMultiple` 次自己的
-    /// `OnPlayedFromHand`。所以内核只要实现这一条，249 张卡的**公共时序**就全对了。
-    ///
-    /// 逐条出处（`out/bp-cardfn.json`，`StatementIndex` 与 Jump 的 `Offset` 同坐标系，
-    /// 已用 `out/audit/p1-jump-targets.py` 验证 1599 条跳转 100% 落在语句集内）：
-    /// <code>
-    /// si=3640  JumpIfNot 5840 cond=cardPlayed.hasDeployment
-    /// si=3676  FetchAllCardsWithEventTrigger(14)     ; OnBeforeOtherCardDeploymentTrigger
-    /// si=4081  PopExecutionFlowIfNot(cancelDeploymentEffect)
-    /// si=4197  breakFlag = true                      ; 有订阅者取消 ⇒ 跳出
-    /// si=4283  JumpIfNot 5702 if !cancelDeploymentEffect
-    /// si=4297..4881  取消分支（NotifySideEffectTrigger 'sideeffect.blockdeployment' + 返回）
-    /// si=5702  EqualEqual_IntInt(targetCardID, 0)    ; ★ 只有**非指向性**部署才取翻倍数
-    /// si=5750  ExecuteOnDeploymentTriggered(cardPlayed, cardPlayed.cardID, out triggerMultiple)
-    /// si=5813  _triggerMultiple = triggerMultiple
-    /// si=6082/6114  cardPlayed.OnPlayedFromHand(GetCardFromID(targetCardID))   ; 第 1 次
-    /// si=6159  if (_triggerMultiple &gt; 0)
-    /// si=6230  while (Temp_int_Variable &lt;= _triggerMultiple) { si=6319 OnPlayedFromHand(...) }
-    /// </code>
-    ///
-    /// 「取消 ⇒ 不跑效果」这一条不是靠语句顺序推的：用
-    /// `out/audit/p1-cfg.py CardPlayedFromHand 4297` 做可达性分析，从取消分支出发
-    /// 可达的 44 条语句**全部**终止于 si=6853 `Return`，不经过 5702/6114。
-    /// 卡面文本独立互证：`card_unit_petlyakov_pe_2ft`「Deployment effects do not trigger.」。
-    ///
-    /// ⚠️ **没做**的一件小事：`si=4308 NotifySideEffectTrigger(side, 'sideeffect.blockdeployment')`
-    /// —— 内核里 `NotifySideEffectTrigger` 整条原语都没有实现（副作用通知通道），
-    /// 不是本次范围，这里不猜它的子动作名。
+    /// CardPlayedFromHand: deployment cancellation skips the own effect only;
+    /// ChooseOne/weather/Pincer and played/entry observers continue (i=4297..5703).
+    /// Non-targeted deployment uses T23 to determine extra own-effect executions.
     /// </summary>
-    private void RunDeploymentEffect(CardInstance card, CardInstance? target, int? instigatorId = null,
+    private bool RunDeploymentEffect(CardInstance card, CardInstance? target, int? instigatorId = null,
         bool nonTargeting = false)
     {
         // si=3640：没有 hasDeployment 的卡（全部指令 + 21 张没这个字段的单位）走 si=5840，
@@ -1417,13 +1719,13 @@ public sealed class MatchEngine
         if (!card.Keywords.Contains(Keyword.Deployment))
         {
             Api.RunCardEffect(card, target);
-            return;
+            return true;
         }
 
         // si=3676..4278：事件 14 的取消钩子。
         if (Api.FireDeploymentCancelHook(card, instigatorId))
         {
-            return;   // si=4297..4881：取消 ⇒ 整条部署效果不跑
+            return false;   // Own deployment is cancelled; PlayCard continues the common chain.
         }
 
         // si=5702/5750：只在「非指向性」部署时取翻倍数（targetCardID == 0）。
@@ -1431,17 +1733,34 @@ public sealed class MatchEngine
             ? Api.SumDeploymentTriggerMultiple(card, instigatorId)
             : 0;
 
+        if (card.Definition.WaitForHandTarget && triggerMultiple > 0)
+        {
+            card.ExtraPlayTriggers = triggerMultiple;
+            Api.RunCardEffect(card, target);
+            return true;
+        }
+
         // si=6114（第 1 次）+ si=6230..6434（再 triggerMultiple 次）。
         for (int i = 0; i <= triggerMultiple; i++)
         {
             Api.RunCardEffect(card, target);
         }
+        return true;
     }
 
     /// <summary>供 <c>CardApi.TriggerDeployment</c> 调用的主动部署效果入口。</summary>
     public void RunDeploymentEffectForTrigger(CardInstance card, int instigatorId)
     {
-        RunDeploymentEffect(card, card.CurrentTarget, instigatorId, nonTargeting: true);
+        // TriggerDeployment i=59/524/956/1119 is a distinct path: it always
+        // repeats directly, with no wait flag or extra-play JSON counter.
+        if (!card.Keywords.Contains(Keyword.Deployment) || Api.FireDeploymentCancelHook(card, instigatorId)) return;
+        BeginEffectResolution();
+        try
+        {
+            int additional = Api.SumDeploymentTriggerMultiple(card, instigatorId);
+            for (int i = 0; i <= additional; i++) Api.RunCardEffect(card, card.CurrentTarget);
+        }
+        finally { EndEffectResolution(); }
     }
 
     /// <summary>
@@ -1459,7 +1778,8 @@ public sealed class MatchEngine
     /// `locationNumber` 按蓝图 `GetNextCardLocationNumber` 的规则「追加到队尾」
     /// （`= QtyInLocation`），而且计数**含 HQ** —— 所以第一个单位的槽位是 1，不是 0。
     /// </summary>
-    private void PlaceOnBoard(CardInstance card, bool toFrontline = false, int locationNumber = -1)
+    private void PlaceOnBoard(CardInstance card, bool toFrontline = false, int locationNumber = -1,
+                              CardMoveReason moveReason = CardMoveReason.PlayCardPlayerMove)
     {
         card.EnteredPlayOnTurn = State.Turn;
 
@@ -1467,7 +1787,7 @@ public sealed class MatchEngine
         int slot = locationNumber >= 0
             ? locationNumber
             : State.Cards(card.Owner, destination).Count;
-        State.Move(card, destination, slot);
+        State.Move(card, destination, slot, moveReason: moveReason);
         Say($"{card} 部署到{(toFrontline ? "前线" : "半场")} {destination} 槽位 {slot}");
     }
 
@@ -1525,7 +1845,7 @@ public sealed class MatchEngine
     ///                                                       ; 递减，但**不**解除
     /// L_02CD i=717  RemovePin(card)                         ; 减到 1 ⇒ 解除
     /// </code>
-    /// ⚠️ 这个函数**没有 side 参数**、且遍历的是全部在场卡 ⇒ 它是在
+    /// 这个函数没有side参数，遍历全部对局卡；>1分支另经在场单位门。它在
     ///    **每一个回合结束时**各跑一次（不是只在自己回合）。配上
     ///    `CardApi.PinUnit` 的初值（`IsSideActive(卡) ? 3 : 2`）正好等于
     ///    权威规则表的「钉住/压制于单位所有者**下个回合结束时**移除」。
@@ -1537,29 +1857,13 @@ public sealed class MatchEngine
     /// </summary>
     private void DecrementPinnedTurnsEndTurn()
     {
-        foreach (var card in State.CardsUnordered())
+        // BP_Logic refreshes GetAllCardInBattle at the loop condition and
+        // again before indexing. Callbacks can append/remove/move cards.
+        for (int index = 0; index < State.AllCardsInBattleOrder.Count; index++)
         {
-            if (card.PinnedTurns < 1)
-            {
-                continue;
-            }
-
-            if (card.PinnedTurns > 1)
-            {
-                card.PinnedTurns--;      // 递减，但**不**解除（蓝图 L_0202 那条分支）
-                continue;
-            }
-
-            // PinnedTurns == 1 ⇒ 到期解除（蓝图 RemovePin）
-            if (card.Keywords.Contains(Keyword.Pinned))
-            {
-                Api.RemoveKeyword(card, Keyword.Pinned);
-                Say($"{card} 的钉住到期解除");
-            }
-            else
-            {
-                card.PinnedTurns = 0;
-            }
+            var card = State.AllCardsInBattleOrder[index];
+            if (card.PinnedTurns > 1) Api.ChangePinnedTurns(card, -1, 0);
+            else if (card.PinnedTurns == 1) Api.RemovePin(card);
         }
     }
 
@@ -1610,7 +1914,7 @@ public sealed class MatchEngine
     /// 「被压制（= `Pinned`；中文客户端把 Pin 译作"压制"）还能上前线」。
     /// </summary>
     private bool PinnedBlocksOperation(CardInstance card)
-        => card.Keywords.Contains(Keyword.Pinned)
+        => card.IsPinned
            && !Api.HasCustomAbility(card, "canOperateWhilePinned");
 
     /// <summary>推进（不要原因）。见带 <c>out reason</c> 的重载。</summary>
@@ -1626,6 +1930,22 @@ public sealed class MatchEngine
     /// 实测对局 `773639` 的 `#45 t9 ML`（人类推前线）就卡在这里。
     /// </summary>
     public bool MoveUnit(CardInstance unit, int targetSlot, out string reason)
+    {
+        BeginEffectResolution();
+        try
+        {
+            bool completed = MoveUnitActionCore(unit, targetSlot, out reason);
+            if (completed)
+            {
+                ExecuteAutoPlayCards();
+                ApplyPendingGotchaPlayReceipts();
+            }
+            return completed;
+        }
+        finally { EndEffectResolution(); }
+    }
+
+    private bool MoveUnitActionCore(CardInstance unit, int targetSlot, out string reason)
     {
         reason = "";
 
@@ -1687,9 +2007,9 @@ public sealed class MatchEngine
             return false;
         }
 
-        if (unit.OperationCost > State.Kredits(unit.Owner))
+        if (unit.TotalOperationCost > State.Kredits(unit.Owner))
         {
-            reason = $"油费不足（油费={unit.OperationCost} kredit={State.Kredits(unit.Owner)}）";
+            reason = $"油费不足（油费={unit.TotalOperationCost} kredit={State.Kredits(unit.Owner)}）";
             return false;
         }
 
@@ -1718,10 +2038,9 @@ public sealed class MatchEngine
 
         // 事件签名携带的是这次推进实际支付的费用。先保存再扣费，避免后续
         // 任何费用重算让订阅卡读到错误值。
-        int moveCost = unit.OperationCost;
+        int moveCost = unit.TotalOperationCost;
         State.AddKredits(unit.Owner, -moveCost);
         State.AddOperationKreditsSpentThisTurn(moveCost);
-        unit.HasMovedThisTurn = true;
 
         RecordAction("XActionMoveCardToLine", unit.Owner, new Dictionary<string, object?>
         {
@@ -1734,27 +2053,18 @@ public sealed class MatchEngine
             ActionValue2.Int("locationNumber", targetSlot),
         });
 
-        // 我方已经占着前线时是"挪槽位"，否则是"推进"。
-        //
-        // ⚠️ 这里**不再**手工刷新前线归属：换区钩子（`FireLocationMoved`）已经按蓝图
-        //    在 `State.Move` 内部做了。依据是 `MoveCardToFrontline` 的语句顺序 ——
-        //    si=13 `CardLocationMoved`（内部 si=53 `UpdateFrontlineIfNeeded`
-        //    ⇒ 发 `OnFrontlineOwnershipChange`）**先**、si=21
-        //    `ExecuteOnMoveToFrontlineCardEffects`（⇒ `OnMoveToFrontline`）**后**。
-        //    旧实现是反的（先 `OnMoveToFrontline`、再刷新归属并补发事件），
-        //    收口到钩子里正好把这个顺序也扳正。
-        State.Move(unit, CardLocation.BoardFrontline, targetSlot);
-        var moveEventArgs = new object?[] { unit, false, moveCost };
-        var moveNamedArgs = new Dictionary<string, object?>(StringComparer.Ordinal)
-        {
-            ["cardMoved"] = unit,
-            ["ForceMove"] = false,
-            ["moveCost"] = moveCost,
-        };
-        Api.FireTrigger("OnMoveToFrontline", unit, unit.Owner, "OnOtherCardMoveToFrontline",
-            eventArgs: moveEventArgs,
-            eventSubject: unit,
-            namedArgs: moveNamedArgs);
+        // CardLocationMoved refreshes physical old/new locations before its
+        // movement callbacks and location tail. Retain the existing slot writer
+        // and same-location callback policy until their separate audit.
+        var oldLocation = unit.Location;
+        State.Move(unit, CardLocation.BoardFrontline, targetSlot,
+            moveReason: CardMoveReason.AdvancePlayerMove, notifyMoved: false);
+        Api.RefreshLocationStatus(new[] { oldLocation, CardLocation.BoardFrontline });
+        if (oldLocation != CardLocation.BoardFrontline)
+            State.CardMoved?.Invoke(unit, oldLocation, CardLocation.BoardFrontline, false, CardMoveReason.AdvancePlayerMove);
+        if (!unit.CanMoveAndAttackInSameTurn) unit.ClearAttackQuotaForMovement();
+        unit.HasMovedThisTurn = true;
+        Api.ExecuteOnMoveToFrontlineCardEffects(unit, false, moveCost);
 
         FireOperationKreditsSpent(unit, moveCost);
 
@@ -1765,8 +2075,9 @@ public sealed class MatchEngine
     /// 蓝图 <c>MoveUnitFromSupportToFrontLine</c> 的效果位移路径。
     ///
     /// 这是卡牌效果调用的免费移动，不经过普通行动方、召唤失调、压制或油费门；
-    /// 蓝图只检查卡在场、<c>cantMove</c>、前线归属和前线容量。成功后不消耗
-    /// 单位的本回合移动额度，但仍派发位置变化与前线进入触发。
+    /// 蓝图检查卡在场、<c>cantMove</c>、前线归属和前线容量。
+    /// 移动后消费额度，再执行反制/自身/T50及零费行动事件。
+    /// 此方法返回内部执行结果；Blueprint的qqq输出由派发器独立处理。
     /// </summary>
     public bool MoveUnitFromSupportToFrontLine(CardInstance unit, int instigatorID,
                                                out string reason)
@@ -1791,29 +2102,43 @@ public sealed class MatchEngine
             return false;
         }
 
-        if (owner == unit.Owner
-            && State.Cards(unit.Owner, CardLocation.BoardFrontline).Count >= State.FrontlineCapacity)
+        int quantity = State.AllCardsInBattleOrder.Count(x => x.Location == CardLocation.BoardFrontline);
+        if (owner == unit.Owner && quantity >= State.FrontlineCapacity)
         {
-            reason = $"我方前线已满（{State.Cards(unit.Owner, CardLocation.BoardFrontline).Count}" +
-                     $"/{State.FrontlineCapacity}）";
+            reason = $"我方前线已满（{quantity}/{State.FrontlineCapacity}）";
             return false;
         }
 
-        int locationNumber = State.NextLocationNumber(unit.Owner, CardLocation.BoardFrontline);
-        State.Move(unit, CardLocation.BoardFrontline, locationNumber);
-
-        var moveEventArgs = new object?[] { unit, true, 0 };
-        var moveNamedArgs = new Dictionary<string, object?>(StringComparer.Ordinal)
-        {
-            ["cardMoved"] = unit,
-            ["ForceMove"] = true,
-            ["moveCost"] = 0,
-            ["instigatorID"] = instigatorID,
-        };
-        Api.FireTrigger("OnMoveToFrontline", unit, unit.Owner, "OnOtherCardMoveToFrontline",
-            eventArgs: moveEventArgs,
-            eventSubject: unit,
-            namedArgs: moveNamedArgs);
+        var oldLocation = unit.Location;
+        // GetNextCardLocationNumber uses physical quantity, then injection
+        // compacts the other cards if the mover already occupies this zone.
+        var others = State.AllCardsInBattleOrder.Where(x => x != unit && x.Location == CardLocation.BoardFrontline)
+            .OrderBy(x => x.LocationNumber).ToArray();
+        if (oldLocation == CardLocation.BoardFrontline)
+            for (int i = 0; i < others.Length; i++) others[i].LocationNumber = i;
+        foreach (var other in others)
+            if (other.LocationNumber >= quantity) other.LocationNumber++;
+        State.Move(unit, CardLocation.BoardFrontline, quantity, notifyMoved: false, normalizeLocation: false);
+        Effects.Blueprint.LiveRuleTables.TryGetEnumName("/Script/kards.ECardLocationEnum", (int)oldLocation, out string oldName);
+        Effects.Blueprint.LiveRuleTables.TryGetEnumName("/Script/kards.ECardLocationEnum", (int)CardLocation.BoardFrontline, out string newName);
+        Effects.Blueprint.LiveRuleTables.TryGetEnumName("/Game/Structs/CardMoveReason.CardMoveReason",
+            (int)CardMoveReason.AdvanceForce, out string reasonName);
+        FireSubAction("ZActionMoveCardToNewLocation", new[] {
+            ActionValue2.Int("cardID", unit.CardId), ActionValue2.Int("instigatorID", instigatorID),
+            ActionValue2.Str("oldLocation", oldName), ActionValue2.Str("newLocation", newName),
+            ActionValue2.Int("newLocationNumber", quantity), ActionValue2.Int("nonVisualLocationNumber", quantity),
+            ActionValue2.Str("moveReason", reasonName),
+            ActionValue2.Int("attackLeft", unit.RemainingAttacks),
+            ActionValue2.Int("movementLeft", unit.HasMovedThisTurn ? 0 : 1),
+        });
+        Api.RefreshLocationStatus(new[] { oldLocation, CardLocation.BoardFrontline });
+        State.CardMoved?.Invoke(unit, oldLocation, CardLocation.BoardFrontline, false, CardMoveReason.AdvanceForce);
+        // Native CanMoveAndAttackInTheSameTurn: IsArmorUnit (tank or
+        // tankdestroyer or its customName1 marker), otherwise the explicit marker.
+        if (!unit.CanMoveAndAttackInSameTurn) unit.ClearAttackQuotaForMovement();
+        unit.HasMovedThisTurn = true;
+        Api.ExecuteOnMoveToFrontlineCardEffects(unit, true, 0);
+        FireOperationKreditsSpent(unit, 0);
         return true;
     }
 
@@ -1822,17 +2147,15 @@ public sealed class MatchEngine
     /// 前线空 → <see cref="Side.NotAvailable"/>；非空 → **第一张牌的 side**。
     ///
     /// ⚠️ 蓝图用的是 `GetAllCardInBattle()` 的**数组顺序**第一张，
-    /// 不是 `locationNumber` 最小的那张。实战里前线只可能有一方的卡
-    /// （互斥规则保证），所以两者等价；这里取数组顺序以保持逐字一致。
+    /// 不是 `locationNumber` 最小的那张，也不先按阵营分组。
+    /// 重入中间状态仍必须按物理数组读取，不能依赖前线互斥假设。
     /// </summary>
     private void UpdateFrontlineOwner()
     {
-        var frontline = State.Cards(Side.Left, CardLocation.BoardFrontline)
-            .Concat(State.Cards(Side.Right, CardLocation.BoardFrontline))
-            .Where(c => !c.IsHq)
-            .ToList();
-
-        State.FrontlineOwner = frontline.Count == 0 ? Side.NotAvailable : frontline[0].Owner;
+        // FetchCardsByLocation returns the first physical battle-array match,
+        // without owner grouping, slot sorting or an HQ exclusion.
+        State.FrontlineOwner = State.AllCardsInBattleOrder
+            .FirstOrDefault(c => c.Location == CardLocation.BoardFrontline)?.Owner ?? Side.NotAvailable;
     }
 
     /// <summary>
@@ -1849,7 +2172,7 @@ public sealed class MatchEngine
     /// si=262  EnumCompareSide(old, FirstCard.side)
     /// si=352      相等 ⇒ 直接返回（**归属没变就不发事件**）
     /// si=...  GameStateRef.UpdateFrontlineOwnerSide(新归属)
-    /// si=811  FetchAllCardsWithEventTrigger(27) → OnFrontlineOwnershipChange(instigator, old, new)
+    /// si=601  FetchAllCardsWithEventTrigger(27)；si=870 每项重读当前归属后派发
     /// </code>
     /// ⇒ 「算 → 变了才发」是蓝图原样，不是本内核的取舍。
     ///
@@ -1861,7 +2184,7 @@ public sealed class MatchEngine
     /// （那张卡是 `Create` 到前线再 `Move` 到**同一区**的，换区钩子根本不发，
     /// 见 `CardApi.SpawnOnBattlefield` 里的注释与出处）。
     /// </summary>
-    internal void RefreshFrontlineOwner(CardInstance subject)
+    internal void RefreshFrontlineOwner(CardInstance? subject)
     {
         // 必须在 `UpdateFrontlineOwner()` **之前**读：这正是蓝图 si=5 取
         // `oldFrontlineOwnerSide` 的时机，也是"变了才发"的比较基准。
@@ -1872,22 +2195,7 @@ public sealed class MatchEngine
             return;
         }
 
-        // `UpdateFrontlineIfNeeded` uses FetchAllCardsWithEventTrigger(27) and
-        // invokes the same `OnFrontlineOwnershipChange` program on every
-        // subscriber.  This is a global event, despite its name lacking the
-        // usual `OnOther` prefix.  Keep the mover as the event payload while
-        // letting FireTrigger iterate every live card, including hand cards.
-        var named = new Dictionary<string, object?>(StringComparer.Ordinal)
-        {
-            ["instigator"] = subject.CardId,
-            ["instigatorID"] = subject.CardId,
-            ["oldSide"] = (int)oldOwner,
-            ["newSide"] = (int)State.FrontlineOwner,
-        };
-        Api.FireTrigger("OnFrontlineOwnershipChange", subject: null, controller: subject.Owner,
-            eventArgs: new object?[] { subject.CardId, (int)oldOwner, (int)State.FrontlineOwner },
-            eventSubject: subject,
-            namedArgs: named);
+        Api.ExecuteFrontlineOwnershipChange(subject, oldOwner);
     }
 
     // ==================== 离场触发点 ====================
@@ -1899,59 +2207,66 @@ public sealed class MatchEngine
     /// 全卡池 67 张）全靠这个触发点撤销自己的 buff —— 光环（①）只是它的一个子类。
     /// **必须在真正移动之前调用**：效果里要读卡的旧位置。
     ///
-    /// 三个名字一起发，因为实测三种订阅都存在且都在同一个时机：
-    /// - `OnLeaveBoardOrOwner`（卡自己）
-    /// - `OnOtherCardLeaveBoardOrOwner`（别人，`card_unit_214th_amur` 用）
-    /// - `OnAfterOtherCardLeaveBoardOrOwner`（别人，`card_unit_big_red_one` 用；
-    ///   名字里的 After 指的是「在其它触发点之后」，实测它和上面那个同一个入口）
+    /// 这里只发 before；真正移动后调用 FireAfterLeaveTrigger。
+    /// 未抑制主体先执行自身事件，再查询并广播给其他订阅者。
     /// </summary>
     /// <param name="goingToLocation">卡要去哪（卡牌蓝图的第 1 个入参就是它）。</param>
-    /// <param name="includeAfterEvents">是否执行销毁/转换路径的 after 离场事件。</param>
-    public void FireLeaveTrigger(CardInstance card, CardLocation goingToLocation,
-                                 bool includeAfterEvents = true)
+    public void FireLeaveTrigger(CardInstance card, CardLocation goingToLocation, int method = 0,
+                                 CardLocation? oldLocation = null)
     {
-        if (card.IsHq)
+        if (card.IsHq || !(oldLocation ?? card.Location).IsBoard())
         {
             return;   // HQ 不会「离场」
         }
 
-        var subject = card;
-        FireSubActionWithCard("ZActionLeaveBoardOrOwner", subject, (int)goingToLocation);
-
-        // 两遍发，因为「别人」那一支有两个并列的程序名：
-        //   OnOtherCardLeaveBoardOrOwner       ← card_unit_214th_amur
-        //   OnAfterOtherCardLeaveBoardOrOwner  ← card_unit_big_red_one
-        // 主体自己（selfProgramName = OnLeaveBoardOrOwner）只在第一遍发一次。
-        //
-        // `goingToLocation` 是这两个事件的**第一个入参**，`card_unit_214th_amur`
-        // 拿它和 [5,6,7]（双方半场 + 前线）比 —— 去弃牌堆(8)/手牌(3,4)/牌库(1,2) 时
-        // 它不还原 buff。这不是 bug：真机走 discard 时**根本不发这个事件**
-        // （走的是 OnDestroyed 那条链），所以这里传真实去向，让判据自然成立/不成立。
-        var eventArgs = new object?[] { card, (int)goingToLocation, 0 };
-        Api.FireTrigger("OnLeaveBoardOrOwner", subject, subject.Owner,
-            "OnOtherCardLeaveBoardOrOwner", "OnLeaveBoardOrOwner", eventArgs, goingToLocation);
-        Api.FireTrigger("OnLeaveBoardOrOwner", subject, subject.Owner,
-            "OnAfterOtherCardLeaveBoardOrOwner", "OnLeaveBoardOrOwner", eventArgs, goingToLocation);
-
-        if (!includeAfterEvents)
+        FireSubActionWithCard("ZActionLeaveBoardOrOwner", card, (int)goingToLocation);
+        Api.RemovePincerEffects(card);
+        var named = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
-            return;
-        }
+            ["cardLeaving"] = card, ["goingToLocation"] = (int)goingToLocation,
+            ["NewLocation"] = (int)goingToLocation, ["method"] = method,
+        };
+        if (!card.IsSuppressed)
+            Api.FireTrigger("OnLeaveBoardOrOwner", card, card.Owner,
+                eventArgs: new object?[] { (int)goingToLocation, method },
+                goingToLocation: goingToLocation, namedArgs: named,
+                includeUnavailableRecipients: oldLocation.HasValue);
 
-        // 「离场之后」—— 出处 `out/bp-cardfn.json` 函数
-        // `ExecuteOnAfterLeaveBoardOrOwnerEvents`：
-        //   `OnAfterLeaveBoard(ECardLocationEnum goingToLocation)`（自己，签名 `BaseCardObject.h:808`）
-        //   `OnAfterOtherCardLeaveBoardOrOwner(UBaseCardObject* cardLeaving, ECardLocationEnum OldLocation)`
-        // 注意：**两个变体的第 2 个参数语义不同** —— 自己那个是"去向"，
-        // 别人那个是"**旧位置**"（槽位名 `OldLocation`）。所以这里两个名字都放进具名载荷。
+        // i=845/899: self precedes the T46 query; eligibility is fixed by that query.
+        var observers = Api.CaptureRegisteredTriggerSnapshot("OnOtherCardLeaveBoardOrOwner")
+            .Where(observer => observer.CardId != card.CardId).ToArray();
+        foreach (var observer in observers)
+            Api.FireTrigger("OnOtherCardLeaveBoardOrOwner", observer, observer.Owner,
+                selfProgramName: "OnOtherCardLeaveBoardOrOwner", eventSubject: card,
+                eventArgs: new object?[] { card, (int)goingToLocation, method },
+                goingToLocation: goingToLocation, namedArgs: named,
+                recipientSnapshot: new[] { observer }, includeUnavailableRecipients: true);
+    }
+
+    /// <summary>BP_CardFunctions after helper: observers see OldLocation, self sees destination.</summary>
+    public void FireAfterLeaveTrigger(CardInstance card, CardLocation goingToLocation, CardLocation oldLocation)
+    {
+        if (card.IsHq || !oldLocation.IsBoard()) return;
+        Api.RemovePincerEffects(card);
         var afterNamed = new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             ["goingToLocation"] = (int)goingToLocation,
-            ["OldLocation"] = (int)card.Location,
+            ["OldLocation"] = (int)oldLocation,
             ["cardLeaving"] = card,
         };
-        Api.FireTrigger("OnAfterLeaveBoard", subject, subject.Owner, "OnAfterOtherCardLeaveBoardOrOwner",
-            eventArgs: eventArgs, goingToLocation: goingToLocation, namedArgs: afterNamed);
+        if (!card.IsSuppressed)
+            Api.FireTrigger("OnAfterLeaveBoard", card, card.Owner,
+                eventArgs: new object?[] { (int)goingToLocation },
+                goingToLocation: goingToLocation, namedArgs: afterNamed,
+                recipientSnapshot: new[] { card }, includeUnavailableRecipients: true);
+        // i=836/881: the T8 query follows the self callback and preserves its array.
+        var observers = Api.CaptureRegisteredTriggerSnapshot("OnAfterOtherCardLeaveBoardOrOwner")
+            .Where(observer => observer.CardId != card.CardId).ToArray();
+        foreach (var observer in observers)
+            Api.FireTrigger("OnAfterOtherCardLeaveBoardOrOwner", observer, observer.Owner,
+                selfProgramName: "OnAfterOtherCardLeaveBoardOrOwner", eventSubject: card,
+                eventArgs: new object?[] { card, (int)oldLocation }, namedArgs: afterNamed,
+                recipientSnapshot: new[] { observer }, includeUnavailableRecipients: true);
     }
     /// <summary>给「离场」这类带参数的事件记一条子动作（便于回放比对）。</summary>
     private void FireSubActionWithCard(string name, CardInstance card, int goingToLocation)
@@ -1962,37 +2277,12 @@ public sealed class MatchEngine
         });
 
     /// <summary>
-    /// Dispatch the operation-cost event pair used by cards such as Landwehr.
-    /// The Blueprint helper broadcasts to other subscribers first, then calls
-    /// the operated card itself; a suppressed operated card skips both paths.
+    /// Current ExecuteOnOperationKreditsSpent: i=38 skips only the suppressed
+    /// subject's callback; i=594 calls it before jumping back to the T68 query.
+    /// The observer loop separately rejects suppressed recipients at i=381.
     /// </summary>
     private void FireOperationKreditsSpent(CardInstance operated, int cost)
-    {
-        if (operated.IsSuppressed)
-        {
-            return;
-        }
-
-        var otherNamedArgs = new Dictionary<string, object?>(StringComparer.Ordinal)
-        {
-            ["cardOperated"] = operated,
-            ["kreditsSpent"] = cost,
-        };
-        Api.FireTrigger("OnOtherCardOperationKreditsSpent", operated, operated.Owner,
-            eventArgs: new object?[] { operated, cost },
-            eventSubject: operated,
-            namedArgs: otherNamedArgs,
-            broadcastName: true);
-
-        var selfNamedArgs = new Dictionary<string, object?>(StringComparer.Ordinal)
-        {
-            ["kreditsSpent"] = cost,
-        };
-        Api.FireTrigger("OnOperationKreditsSpent", operated, operated.Owner,
-            eventArgs: new object?[] { cost },
-            eventSubject: operated,
-            namedArgs: selfNamedArgs);
-    }
+        => Api.ExecuteOnOperationKreditsSpent(operated, cost);
 
     // ==================== 攻击 ====================
 
@@ -2011,6 +2301,22 @@ public sealed class MatchEngine
     /// 这里把每条 `return false` 都补上原因，**判据只有这一份**（避免两份漂移）。
     /// </summary>
     public bool Attack(CardInstance attacker, CardInstance defender, out string reason)
+    {
+        BeginEffectResolution();
+        try
+        {
+            bool completed = AttackActionCore(attacker, defender, out reason);
+            if (completed)
+            {
+                ExecuteAutoPlayCards();
+                ApplyPendingGotchaPlayReceipts();
+            }
+            return completed;
+        }
+        finally { EndEffectResolution(); }
+    }
+
+    private bool AttackActionCore(CardInstance attacker, CardInstance defender, out string reason)
     {
         reason = "";
 
@@ -2097,9 +2403,9 @@ public sealed class MatchEngine
             return false;
         }
 
-        if (attacker.OperationCost > State.Kredits(attacker.Owner))
+        if (attacker.TotalOperationCost > State.Kredits(attacker.Owner))
         {
-            reason = $"油费不足（油费={attacker.OperationCost} kredit={State.Kredits(attacker.Owner)}）";
+            reason = $"油费不足（油费={attacker.TotalOperationCost} kredit={State.Kredits(attacker.Owner)}）";
             return false;
         }
 
@@ -2155,7 +2461,7 @@ public sealed class MatchEngine
         if (!CanReachAcrossFrontline(attacker, defender))
         {
             reason = $"够不着（跨战线射程不足：攻方={attacker.Location} " +
-                     $"目标={defender.Location} 射程={attacker.Definition.Range}；" +
+                     $"目标={defender.Location} 射程={attacker.Range}；" +
                      "任一方在前线则不需要射程，双方都在支援线才要射程 ≥ 2）";
             OutOfRangeAttacksRejected++;
             return false;
@@ -2164,7 +2470,7 @@ public sealed class MatchEngine
         // 烟幕（`CanAttack` si=3596-3793，出处见 `LegalTargets` 里那段注释）。
         // 蓝图里这一段的落点比掩护更靠后（si=3596 vs si=2627），所以放在射程之后、
         // 与蓝图同序 —— 拒绝本身与顺序无关，但保持同序便于以后逐条对账。
-        if (defender.Keywords.Contains(Keyword.Smokescreen))
+        if (defender.HasSmokescreen)
         {
             reason = "目标有烟幕（无法被攻击）";
             State.UnimplementedCalls[defender.IsHq
@@ -2216,301 +2522,110 @@ public sealed class MatchEngine
             return false;
         }
 
-        int attackCost = attacker.OperationCost;
-        State.AddKredits(attacker.Owner, -attackCost);
-        State.AddOperationKreditsSpentThisTurn(attackCost);
-        attacker.HasAttackedThisTurn = true;
-        // 攻击额度 -1（蓝图 `SetAttackerHasAttacked`，`BP_CardFunctions.g.cs:33930-33942`：
-        // `attackLeft -= 1` / `hasAttackedThisTurn = True` / `attackCountThisTurn += 1`）。
-        // ⚠️ 位置在**所有门之后** —— 这道门的判据（`CanOperateThisTurn`）在上面已经查过，
-        //    「先置位后校验」正是这一族 bug 的典型形状，别把它挪到前面。
-        attacker.AttacksThisTurn++;
-
-        // ---- 烟幕：**自己攻击之后消失** ----
-        //
-        // ⚠️⚠️ 2026-10-03 更正：这一段原来的注释有**两处**与蓝图控制流相反，已改正 ——
-        //    原注释写「`si=2966`（被压制）⇒ 不移除」与「时机在 `OnBeforeAttack` **之前**
-        //    （si=3511 < si=3590）」，两条都不对。按 `AttackCard` 的**控制流**（不是字节偏移顺序）：
-        // <code>
-        // si=2911 (:0B5F)  _attackerCard.IsLocatedOnBoard(out isIt_2)
-        // si=2952 (:0B88)  JumpIfNot(isIt_2) → 3640            ; 攻击者不在场 ⇒ 整段跳过
-        // si=2966 (:0B96)  JumpIfNot(_attackerCard.isSuppressed) → 3590   ; ★ 条件为**假**才跳
-        // si=3002 (:0BBA)  FetchAllCardsWithEventTrigger(13)               ; T13 那一轮
-        // si=3382 (:0D36)      item.OnBeforeOtherCardAttacks(_attackerCard, _defenderCard)
-        // si=3511 (:0DB7)  _attackerCard.cardFunction.RemoveSmokescreen(attackerCardID, attackerCardID, true, false)
-        // si=3589 (:0E05)  PopExecutionFlow
-        // si=3590 (:0E06)  _attackerCard.OnBeforeAttack(_defenderCard)     ; ★ 接收者只有攻击者
-        // si=3635 (:0E33)  Jump → 3002                                     ; ★ 回到 T13 那一轮
-        // </code>
-        // ⇒ 真实次序 = `OnBeforeAttack`(只给攻击者、被压制时跳过) → T13 广播(排除攻击者)
-        //   → `RemoveSmokescreen`。**被压制的攻击者照样会走到 si=3511**（si=2966 只是跳到
-        //   si=3590，随后 si=3635 又跳回 si=3002），所以 `RemoveSmokescreen` **没有**压制门。
-        //
-        // `RemoveSmokescreen` 没有压制门：被抑制的攻击者也会走到蓝图
-        // `si=3511`，因此攻击后仍应消耗烟幕。被抑制只跳过上面的
-        // `OnBeforeAttack` 自身事件，不影响这一条攻击后清理。
-        if (attacker.Keywords.Contains(Keyword.Smokescreen))
-        {
-            Api.RemoveKeyword(attacker, Keyword.Smokescreen);
-        }
-
+        // AttackCard captures cost before reveal/T30/T31 using the ORIGINAL target.
+        // Positive tax: i=492 falls through to i=506/547/615. Otherwise jump to
+        // i=4706/4747; PopExecutionFlow i=4774 returns to i=643, not a late reread.
+        int attackCost = attacker.TotalOperationCost + Math.Max(0, defender.KreditsTaxAsEnemyTarget);
+        int attackerCardIdAtStart = attacker.CardId;
         RecordAction("XActionAttackCard", attacker.Owner, new Dictionary<string, object?>
         {
             ["attackerCardID"] = attacker.CardId,
             ["defenderCardID"] = defender.CardId,
         });
+        if (CardApi.IsUnrevealedCovertCard(attacker)) Api.RevealCard(attacker, attacker.CardId);
+        if (CardApi.IsUnrevealedCovertCard(defender)) Api.RevealCard(defender, attacker.CardId);
+        if (!attacker.Location.IsBoard() || !defender.Location.IsBoard()) return false;
 
-        // ---- 攻击前触发点（蓝图 `AttackCard` si=2966 / 3590 / 3635 / 3002 / 3382）----
-        //
-        // ⚠️⚠️ 2026-10-03：旧实现把两者塞进**同一次** `FireTrigger`
-        //    （`FireTrigger("OnBeforeAttack", attacker, …, "OnBeforeOtherCardAttacks")`）
-        //    于是 (a) 两者的先后随**遍历序**漂移、(b) 紧接着又
-        //    `FireTrigger("OnBeforeAttack", defender, …)` **给防御方也发了一份**。两处都错。
-        //
-        // 蓝图控制流：
-        //   si=2966  if (!_attackerCard.isSuppressed) → si=3590
-        //   si=3590  _attackerCard.OnBeforeAttack(_defenderCard)     ; ★ 接收者只有**攻击者**
-        //   si=3635  Jump → 3002
-        //   si=3002  FetchAllCardsWithEventTrigger(13)               ; T13 = OnBeforeOtherCardAttacks
-        //   si=3382      item.OnBeforeOtherCardAttacks(_attackerCard, _defenderCard)
-        //   si=4562      （循环内）item != _attackerCard             ; ★ 广播**排除攻击者本人**
-        // ⇒ 次序：**`OnBeforeAttack`(攻击者) → T13 广播(其余卡)**。
-        if (!attacker.Keywords.Contains(Keyword.Suppressed))
+        // T30 i=1058..1650: the first changed target ends the loop.
+        // Save query-time membership, including the attacker. Invoke saved objects
+        // without rechecking registration, suppression or location after callbacks.
+        foreach (var observer in Api.CaptureRegisteredTriggerSnapshot("OnOtherCardAttackSwitchTarget"))
         {
-            Api.FireTrigger("OnBeforeAttack", attacker, attacker.Owner);
-        }
-
-        // ⚠️ `OnBeforeOtherCardAttacks` 的前缀是 `OnBefore`、**不是** `OnOther`，
-        //    `FireTrigger` 的命名判据会把它当成"只发给主体" ⇒ 必须显式 `broadcastName: true`
-        //    （与 `OnBeforeOtherCardPlayedFromHand` 同一个坑，见 `PlayCard` 里那段注释）。
-        //    广播分支本身就排除主体，正好对上蓝图的 `item != _attackerCard`。
-        Api.FireTrigger("OnBeforeOtherCardAttacks", attacker, attacker.Owner, broadcastName: true);
-
-        // T30 `OnOtherCardAttackSwitchTarget` runs after the attack declaration and
-        // before T31 can stop the attack.  The Blueprint keeps the original target
-        // in `oldDefender`; subscribers return the effective target through
-        // `newDefender` (gotcha cards may create and return a replacement unit).
-        var oldDefender = defender;
-        var switchTargetSeed = new Dictionary<string, object?>(StringComparer.Ordinal)
-        {
-            ["cardAttacking"] = attacker,
-            ["oldDefender"] = oldDefender,
-            ["cardID"] = attacker.CardId,
-        };
-        var switchedTargets = Api.BroadcastLocalWithOutParams(
-            "OnOtherCardAttackSwitchTarget", attacker, new[] { "newDefender" },
-            switchTargetSeed);
-        foreach (var hit in switchedTargets)
-        {
-            if (hit.Outs.GetValueOrDefault("newDefender") is CardInstance candidate
-                && candidate.IsAlive
-                && candidate.Location.IsBoard())
+            var hit = Api.BroadcastLocalWithOutParams("OnOtherCardAttackSwitchTarget", attacker,
+                new[] { "newDefender" }, new Dictionary<string, object?>
+                {
+                    ["cardAttacking"] = attacker, ["oldDefender"] = defender,
+                }, only: new[] { observer }, includeSubject: true, recipientsAlreadyFiltered: true).FirstOrDefault();
+            if (hit.Outs?.GetValueOrDefault("newDefender") is CardInstance replacement
+                && !ReferenceEquals(replacement, defender))
             {
-                defender = candidate;
+                defender = replacement;
+                break;
             }
         }
 
-        // T31 `OnOtherCardAttacks` is a locals-only event. Unlike the regular
-        // trigger table it returns `AttackedAndStopped`; any true result sends
-        // the attack down Blueprint's stopped-attack path before damage.
-        var attackEventSeed = new Dictionary<string, object?>(StringComparer.Ordinal)
+        // T31 resets the shared flag before querying. Every saved recipient runs;
+        // a true output writes the flag immediately, while later callbacks may
+        // change it (including through a reentrant attack). Read it only at the end.
+        State.StopAttack = false;
+        bool attackedAndStopped = false;
+        var attackObservers = Api.CaptureRegisteredTriggerSnapshot("OnOtherCardAttacks");
+        foreach (var observer in attackObservers)
         {
-            ["cardAttacking"] = attacker,
-            ["defenderCard"] = defender,
-            ["cardID"] = attacker.CardId,
-        };
-        var stoppedAttack = Api.BroadcastLocalWithOutParams(
-            "OnOtherCardAttacks", attacker,
-            new[] { "stopAttack", "AttackedAndStopped" },
-            attackEventSeed);
+            if (observer.CardId == attackerCardIdAtStart) continue;
+            var hit = Api.BroadcastLocalWithOutParams("OnOtherCardAttacks", attacker,
+                new[] { "stopAttack", "AttackedAndStopped" }, new Dictionary<string, object?>
+                {
+                    ["cardAttacking"] = attacker, ["defenderCard"] = defender,
+                }, only: new[] { observer }, includeSubject: true, recipientsAlreadyFiltered: true).FirstOrDefault();
+            if (hit.Outs?.GetValueOrDefault("stopAttack") is true) State.StopAttack = true;
+            if (hit.Outs?.GetValueOrDefault("AttackedAndStopped") is true) attackedAndStopped = true;
+        }
+        if (State.StopAttack) return true;
 
-        if (stoppedAttack.Any(hit => hit.Outs.GetValueOrDefault("stopAttack") is true
-            || hit.Outs.GetValueOrDefault("AttackedAndStopped") is true))
+        State.AddKredits(attacker.Owner, -attackCost);
+        State.AddOperationKreditsSpentThisTurn(attackCost);
+        if (attacker.Location.IsBoard())
         {
-            // Blueprint `ExecuteStoppedAttack` runs before the operation-cost
-            // event.  This is a real gameplay hook: Meteor and Salamander use
-            // `OnAttackStopped` for their attack-after cleanup.
-            Api.FireTrigger("OnAttackStopped", attacker, attacker.Owner);
-
-            // `ExecuteOnOperationKreditsSpent` still runs for a stopped attack,
-            // but the operation card must never be charged twice.
+            Api.ExecuteBeforeAttackEvents(attacker, defender);
+            if (State.ById(attackerCardIdAtStart) is { } current)
+                Api.RemoveSmokescreen(current, attackerCardIdAtStart, true, false);
+        }
+        else
+        {
             FireOperationKreditsSpent(attacker, attackCost);
+            return true;
+        }
 
-            FireSubAction("ZActionAttackCard", new[]
-            {
-                ActionValue2.Int("attackerCardID", attacker.CardId),
-                ActionValue2.Int("defenderCardID", defender.CardId),
-                ActionValue2.Int("damageDefender", 0),
-                ActionValue2.Int("damageAttacker", 0),
-                ActionValue2.Int("attackerAttackLeft", attacker.Attack),
-                ActionValue2.Int("defenderDefense", defender.Defense),
-            });
+        if (attackedAndStopped)
+        {
+            SetAttackerHasAttacked(attacker);
+            Api.FireTrigger("OnAttackStopped", attacker, attacker.Owner);
+            FireOperationKreditsSpent(attacker, attackCost);
             CheckDeaths();
             return true;
         }
 
-        // Normal attacks dispatch the operation-cost event after the stopped
-        // branch has been ruled out and before damage resolution.
-        FireOperationKreditsSpent(attacker, attackCost);
-
-        bool shockAttack = attacker.Keywords.Contains(Keyword.Shock);
-        bool canCounter = !shockAttack && CanDefenderDamageAttacker(attacker, defender);
-        bool ambushAttack = canCounter
-            && defender.Keywords.Contains(Keyword.Ambush)
-            && !defender.HasBeenAttackedThisTurn
-            && !attacker.Keywords.Contains(Keyword.Immune);
-
-        int attackerDamage = attacker.Attack;
-        int defenderDamage = canCounter ? defender.Attack : 0;
-
-        // Ambush strikes before the attacker. If it kills the attacker, the
-        // Blueprint CalculateDamageDealt branch suppresses the forward hit.
-        if (ambushAttack && defenderDamage > 0)
-        {
-            Api.DealDamage(attacker, defenderDamage, defender,
-                isCombatDamage: true, counterDamage: true);
-            if (!attacker.AliveOnBoard)
-            {
-                attackerDamage = 0;
-            }
-        }
-
-        defender.HasBeenAttackedThisTurn = true;
-
-        // 攻击日志：原先只记「谁被摧毁」「HQ 受伤」，看不出**谁打的、打了几次**。
-        // 实测就因此说不清「PANTHER A ZIMMERIT 是不是一回合攻击了两次」——
-        // 那次它先进场打死 M2A4、接着又对 HQ 打了 11 点（卡面只有 2 攻）。
-        // 把攻击者/目标/伤害/费用/剩余全部打出来，一眼就能看出重复攻击和数值异常。
-        //
-        // ⚠️ **必须在 `DealDamage` 之前打印**。原来写在结算之后，`target.ToString()`
-        //    读的是**打完、且已经 `Destroy` 进弃牌堆**之后的位置，于是日志里出现
-        //    `→ xxx@Discard#2` 这种"攻击弃牌堆里的卡"的假象 —— 实际上目标在
-        //    这一击开始时还好端端在场上（`Attack` 入口刚校验过 `defender.Location.IsBoard()`）。
-        //    `card_event_lotta_svard`（+1 防御）这类效果也会在中间改数值，
-        //    之后再打印就分不清"打的时候是多少"。
-        //    「目标剩」改成**算出来的**（`当前防御 - 本次伤害`），数值和以前一致，
-        //    但不再依赖结算后的现场。
-        Say($"⚔ {attacker} → {(defender.IsHq ? $"{defender.Owner.ToWire()} HQ" : defender.ToString())}"
-            + $"  伤害 {attackerDamage}（攻 {attacker.Attack}，行动费 {attacker.OperationCost}，"
-            + $"余 kredit {State.Kredits(attacker.Owner)}）"
-            + $"  目标剩 {defender.Defense - attackerDamage}"
-            + (defenderDamage > 0 && !defender.IsHq ? $"  反击 {defenderDamage}" : ""));
-
-        // ⚠️ `isCombatDamage: true` / `counterDamage` 以前**没有传**，两个都恒为 false。
-        //    蓝图 `ExecuteAttackCard` 的两处 `ExecuteOnCardDealDamageEffects` 是
-        //    si=3363 `(defender, attacker, finalDamageToDefender, True, False, False)`
-        //    si=3451 `(attacker, defender, damageToAttacker,      True, True,  False)`
-        //    —— 这两个 bool 就是 `OnCardDealDamage` 的 `isCombatDamage` / `CounterDamage`，
-        //    也决定伤害修正链的 `fromAttack` / `isDefenderDamage`
-        //    （`CalculateDamageDealt` si=473/734）。不传等于「攻击不算战斗伤害」。
-        bool unitCombat = !defender.IsHq && Api.IsUnit(defender);
-        if (unitCombat && !ambushAttack)
-        {
-            Api.DealCombatDamagePair(attacker, defender, attackerDamage, defenderDamage,
-                (damageToDefender, damageToAttacker) =>
-                {
-                    attackerDamage = damageToDefender;
-                    defenderDamage = damageToAttacker;
-
-                    FireSubAction("ZActionAttackCard", new[]
-                    {
-                        ActionValue2.Int("attackerCardID", attacker.CardId),
-                        ActionValue2.Int("defenderCardID", defender.CardId),
-                        ActionValue2.Int("damageDefender", damageToDefender),
-                        ActionValue2.Int("damageAttacker", damageToAttacker),
-                        ActionValue2.Int("attackerAttackLeft", attacker.Attack),
-                        ActionValue2.Int("defenderDefense", defender.Defense),
-                    });
-
-                    if (attacker.AliveOnBoard)
-                    {
-                        Api.FireSurvivedCombat(attacker, defender);
-                    }
-
-                    if (defender.AliveOnBoard)
-                    {
-                        Api.FireSurvivedCombat(defender, attacker);
-                    }
-                });
-
-            if (defender.Defense <= 0 && !defender.IsHq)
-            {
-                Destroy(defender, attacker);
-            }
-
-            if (attacker.Defense <= 0 && !attacker.IsHq)
-            {
-                Destroy(attacker, defender);
-            }
-        }
-        else
-        {
-            Api.DealDamage(defender, attackerDamage, attacker, isCombatDamage: true);
-            if (!ambushAttack && defenderDamage > 0)
-            {
-                Api.DealDamage(attacker, defenderDamage, defender,
-                    isCombatDamage: true, counterDamage: true);
-            }
-
-            if (unitCombat)
-            {
-                if (attacker.AliveOnBoard)
-                {
-                    Api.FireSurvivedCombat(attacker, defender);
-                }
-
-                if (defender.AliveOnBoard)
-                {
-                    Api.FireSurvivedCombat(defender, attacker);
-                }
-            }
-
+        bool shockAttack = !defender.IsHq && attacker.Keywords.Contains(Keyword.Shock);
+        Say($"⚔ {attacker} → {defender} 攻击，行动费 {attackCost}");
+        var damage = Api.DealCombatDamagePair(attacker, defender, (toDefender, toAttacker) =>
             FireSubAction("ZActionAttackCard", new[]
             {
                 ActionValue2.Int("attackerCardID", attacker.CardId),
                 ActionValue2.Int("defenderCardID", defender.CardId),
-                ActionValue2.Int("damageDefender", attackerDamage),
-                ActionValue2.Int("damageAttacker", defenderDamage),
+                ActionValue2.Int("damageDefender", toDefender),
+                ActionValue2.Int("damageAttacker", toAttacker),
                 ActionValue2.Int("attackerAttackLeft", attacker.Attack),
                 ActionValue2.Int("defenderDefense", defender.Defense),
-            });
+            }));
 
-            CheckDeaths();
-        }
-
-        // Shock is consumed by the attack itself, regardless of whether the
-        // target was an HQ or a unit. This is the AttackCard RemoveShock step.
-        if (shockAttack && attacker.Keywords.Contains(Keyword.Shock))
-        {
-            Api.RemoveKeyword(attacker, Keyword.Shock);
-        }
-
-        // ⚠️ 「别人攻击之后」的正确程序名是 **`OnAfterOtherCardAttacks`**，
-        //    不是 `OnOtherCardAttacks`（后者在全部 1636 张卡的 entrypoints 里
-        //    **一个订阅者都没有**）。写错名字的后果不是报错，而是**静默不派发** ——
-        //    实测 `card_unit_3_panzergrenadier`（"after you operate a German unit"）
-        //    的带阵营判定那一支就挂在这个名字上，于是它只剩 `OnAfterAttack`
-        //    那条**无条件** +1+1 的分支在生效，表现成"涨超"。
-        Api.FireTrigger("OnAfterAttack", attacker, attacker.Owner, "OnAfterOtherCardAttacks");
+        // Own after-attack event precedes the T4 query, including lethal HQ attacks.
+        Api.ExecuteAfterAttackEvents(attacker, defender, damage.ToDefender, shockAttack, attackCost);
+        FireOperationKreditsSpent(attacker, attackCost);
         CheckDeaths();
         return true;
     }
 
-    private bool CanDefenderDamageAttacker(CardInstance attacker, CardInstance defender)
+    // ExecuteAttackCard i=279 / ExecuteStoppedAttack i=0 consume the attack only
+    // after calculation/before receive hooks. CanMoveThisTurn also consults this flag.
+    internal void SetAttackerHasAttacked(CardInstance attacker)
     {
-        // Artillery attacks and bomber attacks normally take no retaliation;
-        // bombers only take it from fighters and anti-air units. A defending
-        // bomber never retaliates. These same qualifications gate Ambush.
-        if (defender.IsHq || !defender.Definition.IsUnit
-            || attacker.Definition.Type == "artillery"
-            || defender.Definition.Type == "bomber")
-        {
-            return false;
-        }
-
-        // Bombers only take retaliation from fighters and anti-air units.
-        return attacker.Definition.Type != "bomber"
-            || defender.Definition.Type == "fighter" || Api.IsAntiAir(defender);
+        // SetAttackerHasAttacked i=379 decrements movementLeft first when
+        // the native armor/custom predicate is false (including stopped attacks).
+        if (!attacker.CanMoveAndAttackInSameTurn) attacker.HasMovedThisTurn = true;
+        attacker.HasEverAttacked = true; // SetAttackerHasAttacked i=168.
+        attacker.HasAttackedThisTurn = true;
+        attacker.AttacksThisTurn++;
     }
 
     /// <summary>列出当前可以攻击的目标。</summary>
@@ -2566,7 +2681,7 @@ public sealed class MatchEngine
         // </code>
         // 卡面互证：`card_unit_85_pioneer_company` / `card_unit_coastwatchers` /
         // `card_unit_royal_ulster_rifles` 等 54 张的「Smokescreen」文本。
-        targets = targets.Where(t => !t.Keywords.Contains(Keyword.Smokescreen)).ToList();
+        targets = targets.Where(t => !t.HasSmokescreen).ToList();
 
         // 末尾这条 `CanReachAcrossFrontline` 是射程判据（见 CanReachAcrossFrontline 的出处注释）。
         // ⚠️ 它现在对**所有**分支一致生效（包括原来那条 Guard 分支）——
@@ -2594,56 +2709,45 @@ public sealed class MatchEngine
     ///
     /// `cantAttack` 是攻击者自己的无条件限制；`cantAttack:&lt;type&gt;` 是
     /// 按目标类型限制（例如 `cantAttack:location` = 不能攻击 HQ），而
-    /// `cantBeAttackedBy:&lt;type&gt;` 是目标卡自己的防护标记。类型名来自
-    /// Blueprint 的 `HasCantAttackType` / `HasCantBeAttackedBy` 实参：
-    /// `location`、`air`、`ground`。
+    /// `cantBeAttackedBy:&lt;type&gt;` 是目标卡自己的防护标记。原生谓词同时
+    /// 查询名称与能力来源；Blueprint先检查具体类型（如location、infantry），
+    /// 再独立检查air/ground类别。
     /// </summary>
     private bool CanAttackByCardRestrictions(CardInstance attacker, CardInstance defender,
                                              out string reason)
     {
         reason = "";
-
-        if (Api.HasCustomAbility(attacker, "cantAttack"))
+        if (Api.HasCantAttack(attacker))
         {
             reason = "unit_cant_attack";
             return false;
         }
 
-        string? defenderType = AttackRestrictionType(defender);
-        if (defenderType is not null
-            && Api.HasCustomAbility(attacker, $"cantAttack:{defenderType}")
-            && !Api.HasCustomAbility(attacker, $"ignoreCantAttack_{defenderType}"))
+        // CanAttack checks the concrete enum label first. Only this check has
+        // an ignoreCantAttack_<type> exception; air/ground are separate gates.
+        string defenderType = defender.Definition.Type ?? "NotAvailable";
+        if (Api.HasCantAttackType(attacker, defenderType)
+                && !Api.HasCustomAbility(attacker, "ignoreCantAttack_" + defenderType)
+            || Api.IsAirUnit(defender) && Api.HasCantAttackType(attacker, "air")
+            || IsGroundAttackRestrictionUnit(defender) && Api.HasCantAttackType(attacker, "ground"))
         {
             reason = "cant_be_attacked_by_unit";
             return false;
         }
 
-        string? attackerType = AttackRestrictionType(attacker);
-        if (attackerType is not null
-            && CardApi.CustomNameHasAttribute(defender, "customName1",
-                $"cantBeAttackedBy:{attackerType}"))
+        string attackerType = attacker.Definition.Type ?? "NotAvailable";
+        if (Api.HasCantBeAttackedBy(defender, attackerType)
+            || Api.IsAirUnit(attacker) && Api.HasCantBeAttackedBy(defender, "air")
+            || IsGroundAttackRestrictionUnit(attacker) && Api.HasCantBeAttackedBy(defender, "ground"))
         {
             reason = "unit_cant_be_attack_by_unit";
             return false;
         }
-
         return true;
     }
 
-    private static string? AttackRestrictionType(CardInstance card)
-    {
-        if (card.IsHq)
-        {
-            return "location";
-        }
-
-        return card.Definition.Type switch
-        {
-            "fighter" or "bomber" => "air",
-            "infantry" or "tank" or "artillery" => "ground",
-            _ => null,
-        };
-    }
+    private static bool IsGroundAttackRestrictionUnit(CardInstance card)
+        => card.Definition.Type is "infantry" or "tank" or "artillery";
 
     /// <summary>
     /// 攻击路径的**目标合法性门**（规则库 `cardsCheckFunctions.CanSelectAsTarget`，
@@ -2708,16 +2812,11 @@ public sealed class MatchEngine
     }
 
     /// <summary>
-    /// 「这张卡被掩护了吗」—— 逐字对应 `BP_CardFunctions::UpdateGuarded`
-    /// （62 条语句，出处见 <see cref="LegalTargets"/> 里的逐语句引用）。
-    ///
-    /// 判据：
-    /// 1. 只对棋盘上的卡（location ∈ {5,6,7}）成立；
-    /// 2. **自己有 Guard ⇒ 恒 false**（掩护卡自己不免疫，si=686/718）；
-    /// 3. 否则 ⟺ **同一条线上 locationNumber ± 1 的邻卡有 Guard**（si=847/1276/1405）。
-    ///
-    /// 蓝图里还有一条 `!IsUnrevealedCovertCard` 的过滤（si=564/1206），
-    /// 由卡面 Covert 关键字和 `IsRevealed` 状态共同判定。
+    /// Legacy dynamic approximation used by attack target filtering.
+    /// Native UpdateGuarded writes CardInstance.IsBeingGuarded explicitly and
+    /// distinguishes effective own Guard, raw neighbor Guard and hidden Covert.
+    /// This helper still reads raw Guard and owner adjacency. Migrate consumers
+    /// only after RevealCard/MakeVeteran/RefreshLocationStatus cache timing is audited.
     /// </summary>
     public bool IsBeingGuarded(CardInstance card)
     {
@@ -2805,7 +2904,7 @@ public sealed class MatchEngine
         }
 
         // 双方都不在前线（支援线 ↔ 支援线 / HQ）⇒ 要跨过前线，需要 range ≥ 2
-        return attacker.Definition.Range >= 2;
+        return attacker.Range >= 2;
     }
 
     // ==================== 伤害与死亡 ====================
@@ -2823,7 +2922,7 @@ public sealed class MatchEngine
                              bool isCombatDamage = false, bool ignoreHeavyArmor = false,
                              bool damageAlreadyCalculated = false)
     {
-        if (amount <= 0 || !target.IsAlive)
+        if (amount <= 0 || (!damageAlreadyCalculated && !target.IsAlive))
         {
             return 0;
         }
@@ -2831,10 +2930,6 @@ public sealed class MatchEngine
         if (!damageAlreadyCalculated)
         {
             amount = CalculateAppliedDamage(target, amount, source, isCombatDamage, ignoreHeavyArmor);
-        }
-        else if (target.Keywords.Contains(Keyword.Immune))
-        {
-            return 0;
         }
 
         if (amount <= 0)
@@ -2847,7 +2942,7 @@ public sealed class MatchEngine
         {
             State.UpdateHQDamagedAmountThisTurn(target.Owner, amount);
             Say($"HQ {target.Owner.ToWire()} 受到 {amount} 伤害，剩余 {target.Defense}");
-            if (target.Defense <= 0)
+            if (target.Defense <= 0 && !damageAlreadyCalculated)
             {
                 State.Finish(target.Owner.Opposite(), "Victory_DestroyHQ");
             }
@@ -2874,15 +2969,6 @@ public sealed class MatchEngine
             {
                 return 0;
             }
-        }
-
-        // BP_CardFunctions::CalculateDamageDealt: a combat source with the
-        // `lethal` custom ability converts any positive combat hit into lethal
-        // damage. Effects and non-combat damage do not use this branch.
-        if (isCombatDamage && source is not null
-            && Api.HasCustomAbility(source, "lethal") && amount > 0)
-        {
-            amount = target.Defense;
         }
 
         return amount;
@@ -2927,171 +3013,191 @@ public sealed class MatchEngine
         }
     }
 
-    public void Destroy(CardInstance card, CardInstance? destroyer = null)
+    /// <summary>ApplyRemoveCardFromBoard + ExecuteOnCardDestroyedFunction.</summary>
+    public void Destroy(CardInstance card, CardInstance? destroyer = null, bool destroyedInCombat = false)
     {
-        if (!card.IsAlive)
-        {
-            return;
-        }
-
+        if (!card.IsAlive || card.IsHq) return;
+        var batch = new[] { card.CardId };
+        BeforeDestroyed(card, destroyer, destroyedInCombat);
+        var oldLocation = card.Location;
+        FireLeaveTrigger(card, CardLocation.Discard, method: 1);
         Say($"{card} 被摧毁");
-
-        // ---- 「即将被摧毁」----
-        //
-        // 出处 `out/bp-cardfn.json` 函数 `ExecuteOnBeforeOtherCardDestroyed`
-        // （`cardDestroyedID, AttackerID, TriggerNotDestroyed, DestroyedInCombat`，30 条语句）：
-        // <code>
-        // si=140  JumpIfNot(_cardDestroyed.isSuppressed) -> si=520   ; ★ 被压制 ⇒ 两个名字都不发
-        // si=176  FetchAllCardsWithEventTrigger(15)                  ; 15 = 这一族
-        // si=445      EqualEqual_IntInt(cardDestroyedID, item.cardID)
-        // si=505      JumpIfNot(...) -> si=653
-        // si=520          _cardDestroyed.OnBeforeDestroyed(_attacker, TriggerNotDestroyed)    ← 自己
-        // si=653      item.OnBeforeOtherCardDestroyed(_cardDestroyed, _attacker,
-        //                                            TriggerNotDestroyed, DestroyedInCombat) ← 别人
-        // </code>
-        // ⇒ 一次 FireTrigger 同时覆盖"自己那一路"和"别人那一路"；
-        //   被压制的卡**两个都不发**（旧实现无条件发 `OnBeforeDestroyed`）。
-        // `DestroyedInCombat` 这个入参内核没有建模，恒传 false（近似，不猜）。
-        if (!card.Keywords.Contains(Keyword.Suppressed))
-        {
-            Api.FireTrigger("OnBeforeDestroyed", card, card.Owner, "OnBeforeOtherCardDestroyed",
-                eventArgs: new object?[] { card, destroyer, false, false },
-                eventSubject: card,
-                namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
-                {
-                    ["cardDestroyed"] = card,
-                    ["attacker"] = destroyer,
-                    ["TriggerNotDestroyed"] = false,
-                    ["DestroyedInCombat"] = false,
-                });
-        }
-
         FireSubAction("ZActionDestroyUnit", new[]
         {
             ActionValue2.Int("destroyerCardID", destroyer?.CardId ?? 0),
-            ActionValue2.Int("destroyedLocation", (int)card.Location),
+            ActionValue2.Int("destroyedLocation", (int)oldLocation),
         });
+        // ApplyRemoveCardFromBoard -> CardLocationMoved: Discard retains its old number,
+        // then RefreshLocationStatus runs before ExecuteOnCardLocationMoved.
+        State.Move(card, CardLocation.Discard, locationNumber: card.LocationNumber,
+            moveReason: CardMoveReason.Destroyed, notifyMoved: false, normalizeLocation: false);
+        Api.RefreshLocationStatus(new[] { oldLocation, CardLocation.Discard });
+        State.CardMoved?.Invoke(card, oldLocation, CardLocation.Discard, false, CardMoveReason.Destroyed);
+        FireAfterLeaveTrigger(card, CardLocation.Discard, oldLocation);
+        ExecuteDestroyed(card, destroyer, oldLocation, batch, destroyedInCombat);
+    }
 
-        // 离场触发点在**移动之前**发：光环（OnLeaveBoardOrOwner 族）要在这里把
-        // 自己挂上去的 buff 撤掉，而效果里判的是「卡还在不在场」，
-        // 先 Move 再发的话判据会变成 false、还原逻辑整段跳过。
-        if (card.Location.IsBoard() && !card.IsHq)
+    /// <summary>ExecuteAttackCard i=3967..4442: simultaneous destruction with distinct killers.</summary>
+    internal void DestroyCombatPair(CardInstance defender, CardInstance attacker)
+    {
+        var cards = new[] { defender, attacker };
+        var killers = new[] { attacker, defender };
+        var oldLocations = cards.Select(c => c.Location).ToArray();
+        for (int i = 0; i < cards.Length; i++) BeforeDestroyed(cards[i], killers[i], true);
+        foreach (var card in cards) FireLeaveTrigger(card, CardLocation.Discard, method: 1);
+        for (int i = 0; i < cards.Length; i++)
         {
-            FireLeaveTrigger(card, CardLocation.Discard);
+            // ExecuteAttackCard i=4151/4208 calls CardLocationMoved separately:
+            // each removal refreshes its location before its own movement callbacks.
+            State.Move(cards[i], CardLocation.Discard, locationNumber: cards[i].LocationNumber,
+                moveReason: CardMoveReason.Destroyed, notifyMoved: false, normalizeLocation: false);
+            Api.RefreshLocationStatus(new[] { oldLocations[i], CardLocation.Discard });
+            State.CardMoved?.Invoke(cards[i], oldLocations[i], CardLocation.Discard, false, CardMoveReason.Destroyed);
         }
+        for (int i = 0; i < cards.Length; i++) FireAfterLeaveTrigger(cards[i], CardLocation.Discard, oldLocations[i]);
+        for (int i = 0; i < cards.Length; i++)
+            ExecuteDestroyed(cards[i], killers[i], oldLocations[i], new[] { cards[i].CardId, killers[i].CardId }, true);
+    }
 
-        // `destroyedLocation` 取的是**移动之前**的位置 —— 蓝图 `ApplyRemoveCardFromBoard`
-        // （`out/bp-cardfn.json`）的顺序是：
-        // <code>
-        // stmt 6   oldLocation = leavingCardRef.location                  ; 先取
-        // stmt 29  ExecuteOnCardDestroyedFunction(cardID, oldLocation, instigatorID, …)  ; 再发事件
-        // stmt 36  MoveCardZBeforeDiscard(cardID, oldLocation)            ; 最后才搬
-        // </code>
-        var destroyedLocation = (int)card.Location;
-
-        if (((CardLocation)destroyedLocation).IsBoard())
+    /// <summary>
+    /// ApplyDestroyMultipleCards: all before hooks, all leaves, all moves, all
+    /// after-leave hooks, then destruction effects. Every callback sees the same batch.
+    /// </summary>
+    public void DestroyMultiple(IReadOnlyList<CardInstance> cards, CardInstance? destroyer)
+    {
+        var targets = cards.Where(x => !x.IsHq).ToArray();
+        var ids = targets.Select(x => x.CardId).ToArray();
+        var locations = new Dictionary<int, CardLocation>();
+        var affected = new HashSet<CardLocation>();
+        foreach (var card in targets)
         {
-            State.RecordDestroyedCard(card.CardId, Api.IsUnit(card) && !card.IsHq);
+            BeforeDestroyed(card, destroyer, false);
+            locations[card.CardId] = card.Location;
+            affected.Add(card.Location);
         }
+        foreach (var card in targets)
+        {
+            if (card.Location == CardLocation.Discard) locations.Remove(card.CardId);
+            else FireLeaveTrigger(card, CardLocation.Discard, method: 1);
+        }
+        foreach (var card in targets)
+        {
+            // The batch Blueprint uses SetCardLocationAndLocNumber, not CardLocationMoved.
+            // That setter skips the locationNumber write for Discard.
+            State.Move(card, CardLocation.Discard, locationNumber: card.LocationNumber,
+                notifyMoved: false, normalizeLocation: false);
+        }
+        // i=1509 refreshes affected locations before any move callback.
+        Api.RefreshLocationStatus(affected);
+        for (int i = 0; i < targets.Length; i++)
+            ExecuteLocationMovedEvents(targets[i], locations.GetValueOrDefault(targets[i].CardId), CardLocation.Discard, false, CardMoveReason.Destroyed);
+        for (int i = 0; i < targets.Length; i++)
+            FireAfterLeaveTrigger(targets[i], CardLocation.Discard, locations.GetValueOrDefault(targets[i].CardId));
+        for (int i = 0; i < targets.Length; i++)
+            ExecuteDestroyed(targets[i], destroyer, locations.GetValueOrDefault(targets[i].CardId), ids, false);
+        if (affected.Contains(CardLocation.BoardFrontline)) RefreshFrontlineOwner(null);
+    }
 
-        State.Move(card, CardLocation.Discard);
+    internal void BeforeDestroyed(CardInstance card, CardInstance? killer, bool combat, bool triggered = false)
+    {
+        // ExecuteOnBeforeOtherCardDestroyed i=140/520/574: suppressed skips only self.
+        if (!card.IsSuppressed)
+            Api.FireTrigger("OnBeforeDestroyed", card, card.Owner,
+                eventArgs: new object?[] { killer, triggered }, eventSubject: card,
+                namedArgs: new Dictionary<string, object?>
+                {
+                    ["killer"] = killer, ["attacker"] = killer, ["TriggerNotDestroyed"] = triggered,
+                });
+        // i=176 queries after the self callback. The returned T15 array has
+        // no location filter and is not re-filtered during observer callbacks.
+        var observers = Api.CaptureRegisteredTriggerSnapshot("OnBeforeOtherCardDestroyed")
+            .Where(observer => observer.CardId != card.CardId).ToArray();
+        foreach (var observer in observers)
+            Api.FireTrigger("OnBeforeOtherCardDestroyed", observer, observer.Owner,
+                selfProgramName: "OnBeforeOtherCardDestroyed",
+                eventArgs: new object?[] { card, killer, triggered, combat }, eventSubject: card,
+                namedArgs: new Dictionary<string, object?>
+                {
+                    ["cardDestroyed"] = card, ["killer"] = killer, ["attacker"] = killer,
+                    ["TriggerNotDestroyed"] = triggered, ["DestroyedInCombat"] = combat,
+                }, recipientSnapshot: new[] { observer }, includeUnavailableRecipients: true);
+    }
 
-        // ---- 「被摧毁」----
-        //
-        // 出处 `out/bp-cardfn.json` 的 `ExecuteOnCardDestroyedFunction`
-        // （入参 `cardID, location, attackerCardID, allCardsGettingDestroyed, destroyedInCombat`）：
-        // <code>
-        // stmt 3/4  localKiller = (attackerCardID > 0) ? GetCardFromID(attackerCardID) : NoObject
-        // stmt 23   localDestroyedCard.OnDestroyed(localKiller, false)
-        // stmt 50   localLoopCard.OnOtherCardDestroyed(localDestroyedCard, localKiller, false,
-        //                       location,
-        //                       Array_Contains(allCardsGettingDestroyed, localLoopCardID),
-        //                       destroyedInCombat)
-        // </code>
-        // ⇒ 两个程序名的**出参顺序不同**（`OnDestroyed` 的第一个槽是 killer，
-        //    `OnOtherCardDestroyed` 的第一个槽是 cardDestroyed），所以必须按**名字**给值：
-        //    `KismetVm.ResolveEventVar` 的具名载荷分支排在「`…ID` ⇒ 事件主体」和最终
-        //    `eventSubject ?? Self` 兜底**之前**（KismetVm.cs:1032）。
-        //
-        // ⚠️ 修之前这里**一个载荷都没传**，于是：
-        //    · `K2Node_Event_killer` 落到兜底 ⇒ 解析成**被摧毁的那张卡自己**；
-        //    · `K2Node_Event_TriggerNotDestroyed` 也解析成那张卡 ——
-        //      它是个 Bool 槽，塞进去的是 CardInstance，`KismetVm.Truthy`
-        //      对 `CardInstance` 恒真（KismetVm.cs:899）。
-        //    实测后果（`card_event_last_ditch` 卡面「When an enemy unit destroys a
-        //    friendly unit, destroy the enemy unit」，IR i=10 / i=24）：
-        //      i=10  jumpIfNot(K2Node_Event_TriggerNotDestroyed) → i=29
-        //      i=24  jump → i=553（return）   ; ★ TriggerNotDestroyed 被读成真 ⇒ 整条效果直接返回，
-        //                                      i=507 的 DestroyCard(K2Node_Event_killer) 根本走不到
-        //    同类门还有 `card_unit_142nd_infantry_regiment`（"When this unit destroys an
-        //    enemy unit, your HQ gains +2 defense"）—— 门是 `killer == self`（IR i=29），
-        //    读到自己 ⇒ 恒假 ⇒ 加防永不生效。
-        //    全卡池读 `K2Node_Event_killer` 的：`OnOtherCardDestroyed` 27 张、
-        //    `OnDestroyed` 6 张、`OnBeforeOtherCardDestroyed` 2 张（那一处见上面的
-        //    `namedArgs`：它给的是 `attacker`，而槽位名是 `killer`，同样读不到 —— 属于同一
-        //    个坑，但**没有**在本次改动里动它，见报告）。
-        //
-        // ⚠️ `destroyedInCombat` / `selfIsAlsoGettingDestroyed` **故意不给值**：
-        //    这两个在内核里没有建模（前者要 `Destroy` 知道「这次是不是战斗致死」，
-        //    后者要 `allCardsGettingDestroyed` 这一批的名单），按名字塞一个猜出来的
-        //    false 会一次性翻掉 8 + 4 张卡的分支，且没有任何证据支撑。保持现状（落到
-        //    兜底），把不确定性写在这里。
-        //    `TriggerNotDestroyed` 不同：它不是状态量 —— 蓝图第一遍恒传 false
-        //    （stmt 50），只有「翻倍再触发一遍」那一遍才传 true（stmt 61），而内核
-        //    只派发一遍，所以 false 是**有据可依**的确定值。
-        Api.FireTrigger("OnDestroyed", card, card.Owner, "OnOtherCardDestroyed",
-            eventSubject: card,
-            namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
+    internal void ExecuteDestroyed(CardInstance card, CardInstance? killer, CardLocation location,
+                                  IReadOnlyList<int> batch, bool combat)
+    {
+        // ReceiveActionDestroy*: history is updated after movement and before
+        // destruction callbacks; explicit off-board destruction also counts.
+        State.RecordDestroyedCard(card.CardId, card.Owner, Api.IsUnit(card));
+        // Capture T24 before OnDestroyed can create/remove subscribers (i=225).
+        var destructionRecipients = Api.CaptureRegisteredTriggerSnapshot("OnDestructionEffectTriggered");
+        void SelfDestroyed(bool repeated) => Api.FireTrigger("OnDestroyed", card, card.Owner,
+            eventArgs: new object?[] { killer, repeated }, eventSubject: card,
+            namedArgs: new Dictionary<string, object?>
             {
-                ["cardDestroyed"] = card,
-                ["killer"] = destroyer,
-                ["TriggerNotDestroyed"] = false,
-                ["destroyedLocation"] = destroyedLocation,
+                ["killer"] = killer, ["TriggerNotDestroyed"] = repeated,
             });
+        int NotifyDestruction(bool skipSuppress = false) => Api.FireDestructionEffectTriggered(
+            card, killer, batch, destructionRecipients, skipSuppress);
 
-        // ---- 「一个摧毁效果触发了」（事件 24）----
-        //
-        // 出处 `out/bp-cardfn.json` 的 `TriggerDestruction`：
-        // <code>
-        // si=905   BooleanAND(Not(CustomName1HasAttribute("StopDestructionEffect")), card.hasDestruction)
-        // si=965   PopExecutionFlowIfNot(...)                      ; 假 ⇒ 整块跳过
-        // si=1237  localCardUsedForTriggeringDestructionEffect.OnDestroyed(NoObject{}, true)
-        // si=1286  ExecuteOnDestructionEffectTriggered(..., out TriggerMultiple)
-        // si=1346  if (TriggerMultiple &gt; 0) { loop 1..TriggerMultiple: si=1515 再整轮派发 }
-        // </code>
-        //
-        // ⚠️ **这里只加事件 24，没有给上面那句 `OnDestroyed` 加 `hasDestruction` 门** ——
-        //    是查过之后有意不加的，不是漏了：
-        //    IR 里订阅 `OnDestroyed` 的有 79 张卡，其中 **7 张没有 `hasDestruction`**。
-        //    逐张看过它们的函数体，**不是空壳**：
-        //      · `card_unit_daimler_mk_ii_cam1` / `card_unit_kumamoto_regiment_cam1`
-        //        —— `HasCampaignUpgrade(6)` 门后面才是战役升级效果
-        //      · `card_unit_14_panzergrenadier` —— `IsVeteran` / `RemovePinnedOverride` 收尾
-        //      · `card_unit_superman` —— `CustomName1Remove("StopDestructionEffect")` 收尾
-        //      · 另 3 张（`641st_rifles` / `dornier_do_17` / `t_28_pincer`）确实是空壳
-        //    也就是说「`OnDestroyed` ⟺ hasDestruction」这条不成立：这些卡的 `OnDestroyed`
-        //    是**另一条路径**进来的。拿 `hasDestruction` 去卡它们会静默砍掉 4 张卡的真实逻辑，
-        //    所以宁可保持原样、把不确定性写在这里。
-        //    事件 24 那一侧没有这个矛盾：4 张订阅者的卡面文本**全部**写着
-        //    "when a Destruction effect triggers"，门取 `hasDestruction ‖ HasCustomAbility`。
-        if (Api.ShouldTriggerDestructionEffect(card))
+        // i=292..657: the self-source ability matters; abilities from an observer
+        // trigger that observer's destruction branch below.
+        if (!card.IsSuppressed
+            && !CardApi.CustomNameHasAttribute(card, "customName1", "StopDestructionEffect")
+            && (card.Keywords.Contains(Keyword.Destruction)
+                || Api.HasCustomAbilityFromCard(card, "destruction", card.CardId)))
         {
-            int extra = Api.FireDestructionEffectTriggered(card, destroyer);
+            SelfDestroyed(false);
+            int extra = NotifyDestruction();
             for (int i = 0; i < extra; i++)
             {
-                Api.FireDestructionEffectTriggered(card, destroyer);
+                SelfDestroyed(true);
+                NotifyDestruction();
             }
         }
 
-        // 蓝图 ExecuteOnCardDestroyedFunction 的最后一个触发点：收缴与事件 24
-        // 完成后，再给被摧毁卡自己派发 OnAfterDestroyed(killer, false)。
-        Api.FireTrigger("OnAfterDestroyed", card, card.Owner,
-            eventArgs: new object?[] { destroyer, false },
-            eventSubject: card,
-            namedArgs: new Dictionary<string, object?>(StringComparer.Ordinal)
+        // T39 is fetched after the self effect (i=1016), excluding the destroyed object.
+        var observers = Api.CaptureRegisteredTriggerSnapshot("OnOtherCardDestroyed")
+            .Where(x => x.CardId != card.CardId)
+            .ToArray();
+        foreach (var observer in observers)
+        {
+            void OtherDestroyed(bool repeated) => Api.FireTrigger(
+                "OnOtherCardDestroyed", observer, observer.Owner,
+                selfProgramName: "OnOtherCardDestroyed", eventSubject: card,
+                eventArgs: new object?[] { card, killer, repeated, (int)location,
+                                          batch.Contains(observer.CardId), combat },
+                namedArgs: new Dictionary<string, object?>
+                {
+                    ["cardDestroyed"] = card, ["killer"] = killer,
+                    ["TriggerNotDestroyed"] = repeated, ["destroyedLocation"] = (int)location,
+                    ["selfIsAlsoGettingDestroyed"] = batch.Contains(observer.CardId),
+                    ["destroyedInCombat"] = combat,
+                }, recipientSnapshot: new[] { observer }, includeUnavailableRecipients: true);
+            OtherDestroyed(false);
+            // i=1543..1938: external destruction ability belongs to its source observer.
+            if (Api.HasCustomAbilityFromCard(card, "destruction", observer.CardId))
             {
-                ["killer"] = destroyer,
-                ["TriggerNotDestroyed"] = false,
+                int extra = NotifyDestruction(skipSuppress: true);
+                for (int i = 0; i < extra; i++)
+                {
+                    OtherDestroyed(true);
+                    NotifyDestruction();
+                }
+            }
+        }
+        // i=2147..2572: salvage resolves after destruction broadcasts.
+        if (killer is not null && killer.Keywords.Contains(Keyword.Salvage)
+            && killer.Owner == State.ActiveSide && card.Owner == killer.Owner.Opposite()
+            && !Api.HasCustomAbility(card, "cantBeSalvaged"))
+            Api.SalvageMultipleUnits(new[] { card.CardId }, killer.CardId);
+
+        // i=2636: this self event is outside the destruction/suppression gate.
+        Api.FireTrigger("OnAfterDestroyed", card, card.Owner,
+            eventArgs: new object?[] { killer, false }, eventSubject: card,
+            namedArgs: new Dictionary<string, object?>
+            {
+                ["killer"] = killer, ["TriggerNotDestroyed"] = false,
             });
     }
 
@@ -3134,40 +3240,63 @@ public sealed class MatchEngine
         CardLocation oldLocation = card.Location;
         Side oldOwner = card.Owner;
         CardLocation destination = releaseControl ? originalLocation : toSide.HqOf();
+        // ChangeUnitOwnership i=2683..2854: a lone frontline unit stays there;
+        // with other units present it follows the support-line branch i=753.
+        if (!releaseControl && oldLocation == CardLocation.BoardFrontline
+            && State.Cards(Side.Left, oldLocation).Count + State.Cards(Side.Right, oldLocation).Count == 1)
+            destination = CardLocation.BoardFrontline;
         if (destination is not (CardLocation.BoardHqLeft or CardLocation.BoardHqRight
             or CardLocation.BoardFrontline))
         {
             destination = toSide.HqOf();
         }
 
-        // Blueprint rejects a full destination during normal targeting. The release
-        // path can encounter it later, in which case the card retreats to the
-        // restored owner's hand instead of silently overfilling the support line.
+        int frontlineCount = State.Cards(Side.Left, CardLocation.BoardFrontline).Count
+            + State.Cards(Side.Right, CardLocation.BoardFrontline).Count;
+        // Release queries occupancy before changing ownership or location (i=130).
+        // Its count includes this card when it already occupies the destination.
         bool destinationFull = destination switch
         {
-            CardLocation.BoardFrontline => State.Cards(Side.Left, CardLocation.BoardFrontline).Count
-                + State.Cards(Side.Right, CardLocation.BoardFrontline).Count
-                - (oldLocation == CardLocation.BoardFrontline ? 1 : 0) >= State.FrontlineCapacity,
+            CardLocation.BoardFrontline => frontlineCount
+                - (!releaseControl && oldLocation == CardLocation.BoardFrontline ? 1 : 0) >= State.FrontlineCapacity,
             CardLocation.BoardHqLeft or CardLocation.BoardHqRight
                 => State.Cards(toSide, destination).Count >= GameState.HalfBoardCapacity,
             _ => false,
         };
-        if (destinationFull)
-        {
-            destination = toSide.HandOf();
-        }
+        // The take branch exits at i=927. Release instead restores the original
+        // board location, runs enter events, then applies retreat at i=1948.
+        if (destinationFull && !releaseControl) return false;
+        bool frontlineBlocked = releaseControl && destination == CardLocation.BoardFrontline
+            && State.FrontlineOwner == fromSide
+            && (frontlineCount > 1 || oldLocation != CardLocation.BoardFrontline);
+        bool shouldRetreat = releaseControl && (destinationFull || frontlineBlocked);
 
-        FireLeaveTrigger(card, destination);
+        FireLeaveTrigger(card, destination, method: 5);
         if (!State.ChangeOwner(card, toSide))
         {
             return false;
         }
 
         card.UnderEnemyControl = !releaseControl;
-        State.Move(card, destination, locationNumber: null, changeOwner: true);
-        card.HasMovedThisTurn = false;
-        card.AttacksThisTurn = 0;
-        card.HasAttackedThisTurn = false;
+        State.Move(card, destination, locationNumber: null, changeOwner: true,
+            moveReason: releaseControl ? CardMoveReason.ControlRelease : CardMoveReason.ControlTake);
+        // ChangeUnitOwnership resets movement/attack allowance only when taking
+        // control (i=1090/1190/2859), not in the release branch i=1527..1948.
+        if (!releaseControl)
+        {
+            card.HasMovedThisTurn = false;
+            card.AttacksThisTurn = 0;
+            card.AttackQuotaOffset = 0;
+            card.HasAttackedThisTurn = false;
+        }
+
+        // CardLocationMoved is also explicitly called for same-location owner
+        // changes (i=1363/1780); GameState.Move only notifies on location changes.
+        if (oldLocation == destination)
+            ExecuteLocationMovedEvents(card, oldLocation, destination, true,
+                releaseControl ? CardMoveReason.ControlRelease : CardMoveReason.ControlTake, true);
+
+        FireAfterLeaveTrigger(card, destination, oldLocation);
 
         FireSubAction("ZActionChangeUnitOwnership", new[]
         {
@@ -3181,9 +3310,10 @@ public sealed class MatchEngine
 
         if (destination.IsBoard())
         {
-            Api.FireTrigger("OnEnterPlay", card, card.Owner,
-                eventArgs: new object?[] { card, 0 });
+            ExecuteOnEnterPlayEvents(card, 0);
         }
+
+        if (shouldRetreat) Api.ApplyMakeCardRetreat(card, 0);
 
         return true;
     }

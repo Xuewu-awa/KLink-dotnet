@@ -1,5 +1,6 @@
 using KLink.Bot.Cards;
 using KLink.Bot.Engine;
+using KLink.Bot.Effects;
 
 namespace KLink.Bot.Replay;
 
@@ -330,6 +331,10 @@ public sealed class ReplayRunner
                                      seed: (ulong)replay.MatchId);
         Engine = engine;
         var state = engine.State;
+        // BP_Logic calls SetupSidesInBattle(LocalPlayerSide, OtherSide) once
+        // for the match.  ReplayData carries that side so GetClientSide and
+        // any client-only card branches see the same stored game-state value.
+        state.SetupSidesInBattle(replay.ClientSide);
 
         // ★ 效果生成的卡按**客户端规则**发号（`回合号 × 1000 + 本回合第几张`）。
         //
@@ -578,7 +583,7 @@ public sealed class ReplayRunner
 
         var htConsumed = new Dictionary<int, int>();
 
-        engine.PickHandTarget = (selecting, candidates) =>
+        engine.PickHandTargetId = (selecting, candidates) =>
         {
             if (selecting is null
                 || !htQueue.TryGetValue(selecting.CardId, out var hq)
@@ -591,7 +596,7 @@ public sealed class ReplayRunner
             htConsumed[selecting.CardId] = htConsumed.GetValueOrDefault(selecting.CardId) + 1;
 
             // 答复指向的必须是候选表里的卡；否则如实返回 null（不硬挑一张）
-            return candidates.FirstOrDefault(x => x.CardId == wantId);
+            return wantId; // Preserve explicit ID 0 separately from a missing reply.
         };
 
         engine.PickCardToDraw = (selecting, fromTopOfDeck, _) =>
@@ -1012,7 +1017,54 @@ public sealed class ReplayRunner
                             var selecting = state.ById(a.CardId);
                             if (selecting is null)
                             {
-                                failure = $"找不到挑牌的卡 cardID={a.CardId}";
+                                string? orphanCode = a.Get(WireAction.KeyIndex.CodeSlotA);
+                                string? orphanChoice = orphanCode is not null
+                                    && _db.DeckCodeIds.TryGetValue(orphanCode, out var orphanName)
+                                    ? orphanName : null;
+                                var orphanDefinition = orphanChoice is null
+                                    ? null : _db.Find(orphanChoice);
+                                var adjacentGenerated = state.ById(a.CardId - 1);
+                                bool adjacentIsForecastCard = adjacentGenerated is not null
+                                    && (Effects.CardApi.IsWeatherCard(adjacentGenerated)
+                                        || adjacentGenerated.Name is "card_event_sunny1_blue_sky"
+                                            or "card_event_rain1_mist"
+                                            or "card_event_storm1_gale");
+                                bool forecastContinuation = adjacentGenerated is not null
+                                    && state.GeneratedCardIds.Contains(adjacentGenerated.CardId)
+                                    && adjacentIsForecastCard
+                                    && Effects.Blueprint.KismetLibrary.Default?.FindProgram(
+                                        adjacentGenerated!.Name, "OnHandTargetSelected") is not null
+                                    && orphanDefinition is not null
+                                    && orphanChoice is not null
+                                    && (GameplayTagTable.Has(orphanChoice, "subtype.rain")
+                                        || GameplayTagTable.Has(orphanChoice, "subtype.storm")
+                                        || GameplayTagTable.Has(orphanChoice, "subtype.sunny"));
+                                if (!forecastContinuation)
+                                {
+                                    failure = $"找不到挑牌的卡 cardID={a.CardId}";
+                                    break;
+                                }
+
+                                if (csQueue.TryGetValue(a.CardId, out var orphanQueue)
+                                    && orphanQueue.Count > 0)
+                                {
+                                    orphanQueue.Dequeue();
+                                }
+
+                                bool orphanIsEffect = a.Get(WireAction.KeyIndex.CodeSlotB) == "1";
+                                CardInstance forecastCard = adjacentGenerated
+                                    ?? throw new InvalidOperationException("Forecast source card disappeared");
+                                CardDefinition forecastDefinition = orphanDefinition
+                                    ?? throw new InvalidOperationException("Forecast choice definition disappeared");
+                                if (engine.Api.DevelopChosenCard(
+                                        forecastCard, forecastDefinition.Name, orphanIsEffect) is null)
+                                {
+                                    failure = $"Forecast 后续选择落实失败：源卡={forecastCard.CardId}/" +
+                                              $"{forecastCard.Name} 码={orphanCode}";
+                                    break;
+                                }
+
+                                applied = true;
                                 break;
                             }
 
@@ -1054,6 +1106,22 @@ public sealed class ReplayRunner
                                 break;
                             }
 
+                            // Forecast 的答复也是 CS，但它不是牌库抽牌，也不是
+                            // Develop 卡自己的候选表。蓝图 Forecast 固定提供三张
+                            // 一级天气牌；即使触发它的 PC 因前序状态漂移而未能执行，
+                            // 回放仍应按真实 CS 把选中的天气生成到手牌。
+                            bool forecastReply = GameplayTagTable.Has(
+                                selecting.Name, "ability.forecast")
+                                && chosenName is "card_event_sunny1_blue_sky"
+                                    or "card_event_rain1_mist"
+                                    or "card_event_storm1_gale";
+                            if (forecastReply)
+                            {
+                                engine.Api.SpawnCardInHand(selecting.Owner, chosenName);
+                                applied = true;
+                                break;
+                            }
+
                             // 走哪一族看**这张卡自己有没有 GetChooseSpawnCards**
                             // （有 = Develop 族，候选是卡池模板；没有 = 牌库/占卜族）。
                             bool developFamily = Effects.Blueprint.KismetLibrary.Default?
@@ -1061,7 +1129,8 @@ public sealed class ReplayRunner
 
                             if (developFamily)
                             {
-                                if (engine.Api.DevelopChosenCard(selecting, chosenName) is null)
+                                bool isEffect = a.Get(WireAction.KeyIndex.CodeSlotB) == "1";
+                                if (engine.Api.DevelopChosenCard(selecting, chosenName, isEffect) is null)
                                 {
                                     failure = $"CS③Develop 新建失败：卡={selecting.Definition.Name} " +
                                               $"码={code} 名={chosenName}";

@@ -46,8 +46,15 @@ obj/
 *.db-journal
 data/
 
+# Windows 下 data/ 也会匹配 C# 源码目录 Data/。
+!/KLink.Server/Data/
+!/KLink.Server/Data/*.cs
+
 config.json
 crash.log
+
+# 本地备份目录，不属于源码。
+KLink.Bot.backup-before-bot-deploy/
 
 
 # ---------------------------------------------------------------------------

@@ -43,6 +43,8 @@ public sealed class CardInstance
     // ---- 位置 ----
     public CardLocation Location { get; set; }
     public int LocationNumber { get; set; }
+    /// <summary>Native isBeingGuarded cache (+0x288); refreshed explicitly by UpdateGuarded.</summary>
+    public bool IsBeingGuarded { get; set; }
 
     /// <summary>
     /// 这张卡最近一次从手牌触发时收到的目标。
@@ -50,17 +52,49 @@ public sealed class CardInstance
     /// <c>currentTarget</c> 读取它，而不是重新推导目标。
     /// </summary>
     public CardInstance? CurrentTarget { get; set; }
+    /// <summary>Native Set/UpdateExtraPlayTriggers: selections consume one repeat at a time.</summary>
+    public int ExtraPlayTriggers
+    {
+        get => CustomJson.HasType("extra_play_triggers", CardJsonType.Number)
+            && CustomJson.TryGetValue("extra_play_triggers", out var value)
+            && int.TryParse(value, out int count) ? count : 0;
+        set => CustomJson.Set("extra_play_triggers", value.ToString(System.Globalization.CultureInfo.InvariantCulture), CardJsonType.Number);
+    }
 
     // ---- 数值（可被效果修改，所以与 Definition 分开）----
     public int Attack { get; set; }
     public int Defense { get; set; }
     public int MaxDefense { get; set; }
+    private int? _rangeOverride;
+    /// <summary>
+    /// Mutable native range. Until a runtime write creates an override, reads follow
+    /// the current card definition. Suppression/reset clear the override.
+    /// </summary>
+    public int Range
+    {
+        get => _rangeOverride ?? Definition.Range;
+        set => _rangeOverride = value;
+    }
+    internal void ResetRange() => _rangeOverride = null;
+    internal int? RangeOverride { get => _rangeOverride; init => _rangeOverride = value; }
+    /// <summary>Native byte exileNation; current content defaults it to 0 and suppression clears it.</summary>
+    public int ExileNation { get; set; }
     public int KreditCost { get; set; }
+    /// <summary>Native getTotalKreditCost output clamp; preserve the raw proxy and source ledger.</summary>
+    public int TotalKreditCost => Math.Clamp(KreditCost, 0, 99);
     public int OperationCost { get; set; }
+    // veteranSet changes these raw bases without changing the card identity.
+    internal int? VeteranOperationCost { get; set; }
+    internal int? VeteranHeavyArmor { get; set; }
+    public int EffectType { get; set; }
+    /// <summary>Native getTotalOperationCost has a zero floor and no upper clamp.</summary>
+    public int TotalOperationCost => Math.Max(0, OperationCost);
 
     // ---- 回合内状态 ----
     public int EnteredPlayOnTurn { get; set; } = -1;
     public int OperationsUsedThisTurn { get; set; }
+    // BaseCardObject +0x274; independent of the per-turn attack flag.
+    public bool HasEverAttacked { get; set; }
     public bool HasAttackedThisTurn { get; set; }
 
     /// <summary>
@@ -137,12 +171,9 @@ public sealed class CardInstance
     /// `cipher` —— 卡的**情报值**（`AddIntelToCard` 写、`SetCardsSeenByCipher` /
     /// `GotchaTriggered` 读）。蓝图出处见 <see cref="Effects.CardApi.AddIntelToCard"/>。
     ///
-    /// ⚠️ **CDO 初值缺失**：客户端把它存在卡 CDO 上
-    /// （`decompiled/cards.all.json` 里 25 张卡非 0，例 `card_event_espionage_skirm`=9），
-    /// 但本内核的卡数据（`docs/cards.live.json` / `docs/card-effects.json`）
-    /// **不含该字段**，补表要动 `Cards/CardVarDefaults.cs`（本轮不在改动范围内）
-    /// ⇒ 这里初值一律 **0**（偏小）。52 张 gotcha 卡的 CDO 里**本来就没有** `cipher`
-    /// （已核实）⇒ 对这一族无影响。
+    /// 初值由从 pak CDO 提取的 <see cref="Cards.CardDefinition.Cipher"/> 提供。
+    /// 当前资料中有 25 张卡的值非 0（如 `card_event_espionage_skirm`=9）；
+    /// 52 张 gotcha 卡的 CDO 初值均为 0（已核实）。
     /// </summary>
     public int Cipher { get; set; }
 
@@ -176,6 +207,11 @@ public sealed class CardInstance
     /// 「攻击者本回合不能行动（…已攻击=True…）」⇒ 动作流少应用一条。
     /// </summary>
     public int AttacksThisTurn { get; set; }
+    /// <summary>Quota offset from native writes to attackLeft, independent of attackCountThisTurn.</summary>
+    public int AttackQuotaOffset { get; set; }
+    public int RemainingAttacks => MaxAttacksThisTurn - AttacksThisTurn + AttackQuotaOffset;
+    public void ClearAttackQuotaForMovement() => SetRemainingAttacks(0);
+    public void SetRemainingAttacks(int value) => AttackQuotaOffset = value - MaxAttacksThisTurn + AttacksThisTurn;
 
     /// <summary>
     /// Whether this unit has already been attacked during the current turn.
@@ -187,25 +223,34 @@ public sealed class CardInstance
     /// 本回合最多能攻击几次 —— 蓝图 `DoOnStartOfTurn` 给 `attackLeft` 赋的**初值**
     /// （`BP_Logic.g.cs:3110` / `:3124`）。
     ///
-    /// 用「按当前关键字**现算**」而不是「回合开始时存一个数」，是照蓝图的两条行为：
-    /// <list type="bullet">
-    /// <item>`GiveFury`（`BP_CardFunctions.g.cs:22691-22721`）在 `hasFury` 置位后
-    ///   `attackLeft += 1` —— 本回合中途获得奋战**立刻**多一次攻击额度。</item>
-    /// <item>`RemoveFury`（同文件 `:30759-30769`）用
-    ///   `Min(attackLeft, 1)` 把额度收回 —— 中途失去奋战就只剩 1 次。</item>
-    /// </list>
-    /// 现算正好等价于这两条：`AttacksThisTurn` 是「已用掉的次数」，
-    /// 上限跟着关键字走，两个方向的动态增删都对。
+    /// 当前上限由关键字推导，原生剩余额度写入通过偏移保留。
+    /// GiveFury/RemoveFury显式处理来源、次数门及截断，
+    /// 不能只靠关键字增删隐式加减；负移动额度仍待核查。
     /// </summary>
-    public int MaxAttacksThisTurn => Keywords.Contains(Keyword.Fury) ? 2 : 1;
+    // Keywords stores the raw hasFury flag. The native getter also accepts a
+    // nonempty received-ability source array (not the numeric buff ledger).
+    public bool HasFury => Keywords.Contains(Keyword.Fury)
+        || (ReceivedAbilitiesFromCards.TryGetValue("fury", out var givers) && givers.Count > 0);
+    public bool HasBlitz => Keywords.Contains(Keyword.Blitz)
+        || (ReceivedAbilitiesFromCards.TryGetValue("blitz", out var givers) && givers.Count > 0);
+    // Native getHasSmokescreen: raw flag OR a nonempty registered giver array.
+    public bool HasSmokescreen => Keywords.Contains(Keyword.Smokescreen)
+        || (ReceivedAbilitiesFromCards.TryGetValue("smokescreen", out var sources) && sources.Count > 0);
+    // Native getHasGuard uses raw state or a nonempty source array, not the buff sum.
+    public bool HasGuard => Keywords.Contains(Keyword.Guard)
+        || (ReceivedAbilitiesFromCards.TryGetValue("guard", out var sources) && sources.Count > 0);
+    public bool HasKeyword(string keyword) => keyword switch {
+        Keyword.Fury => HasFury, Keyword.Blitz => HasBlitz, Keyword.Smokescreen => HasSmokescreen, Keyword.Guard => HasGuard, _ => Keywords.Contains(keyword),
+    };
+    public int MaxAttacksThisTurn => HasFury ? 2 : 1;
 
     /// <summary>
     /// 本回合是否**还有攻击额度** —— 蓝图 `UBaseCardObject::HasAttackLeft(bool&)`
     /// （声明 `BaseCardObject.h:969`，函数体在 shipping 二进制里，`BaseCardObject.cpp`
     /// 只是空桩）。语义由上面三条证据钉死为 `attackLeft > 0`，
-    /// 也就是本内核的 `AttacksThisTurn &lt; MaxAttacksThisTurn`。
+    /// 当前用RemainingAttacks表示，包含独立的移动清零偏移。
     /// </summary>
-    public bool HasAttackLeft => AttacksThisTurn < MaxAttacksThisTurn;
+    public bool HasAttackLeft => RemainingAttacks > 0;
 
     /// <summary>
     /// 「三选一」卡（<c>Choose One</c>）选的是第几个分支（0/1）。
@@ -221,7 +266,11 @@ public sealed class CardInstance
     /// 默认 0 与 kardsim 的 <c>EngineHost.ChooseOne = _ =&gt; 0</c> 一致。
     /// 老实现是 <c>Random.Next(2)</c>，会让回放里的分支选择和真实对局不一致。
     /// </summary>
+    // Public model name retained for compatibility: this is native chooseOneIndex (+0x310).
+    // Derived Blueprint ChooseOne fields are stored separately in BlueprintVariables.
     public int ChooseOne { get; set; }
+    /// <summary>Native +0x11d; a mutable target-selection flag, not a target type enum.</summary>
+    public bool SelectTargetOnPlayedFromHand { get; set; }
 
     /// <summary>
     /// 本回合是否已移动过战线。
@@ -258,7 +307,7 @@ public sealed class CardInstance
     public bool HasDeploymentSickness(GameState state)
         => Location.IsBoard()
            && EnteredPlayOnTurn == state.Turn
-           && !Keywords.Contains(Keyword.Blitz);
+           && !HasBlitz;
 
     /// <summary>
     /// 该卡本回合是否还能发起攻击。
@@ -289,23 +338,14 @@ public sealed class CardInstance
            //   （蓝图门是 `HasAttackLeft(attackerCard)`，额度 `attackLeft` 回合开始
            //   被设成 `getHasFury() ? 2 : 1`）。实测对局 389594 `#85/#86 t19`。
            && HasAttackLeft
-           // ★ 移动过就不能再攻击 —— **除非是坦克或蓝图授予的同回合行动能力**。
-           //   出处 `KARDS基础规则参考.md` 兵种表：
-           //     「**坦克**：能在同一回合移动并攻击（一次移动 + 一次攻击，顺序任意）」
-           //   表里**只有坦克**有这条例外；步兵/炮兵/战斗机/轰炸机都没写
-           //   ⇒ 它们都是「移动**或**攻击，二选一」。
-           //   （实测 2026-10-02：AI 的步兵部署后立刻移动并攻击，就是缺这条。）
-           //   蓝图同结论：`MoveCardToFrontline`（`BP_CardFunctions.g.cs:26978-27043`）
-           //   对**不是** `CanMoveAndAttackInTheSameTurn` 的单位把 `attackLeft` 直接置 0
-           //   （`MakeCountAsTank` 与 `card_unit_obice_da_75_13` 都通过该能力名放行）。
-           && (IsTank || CanMoveAndAttackInSameTurn || !HasMovedThisTurn)
            && !HasDeploymentSickness(state);
 
     /// <summary>
     /// 该卡本回合是否还能移动战线（同样受召唤失调限制，见
     /// <see cref="HasDeploymentSickness"/> 里 `CanCardDoAnything` 的出处）。
     ///
-    /// ★ 与 <see cref="CanOperateThisTurn"/> 对称：**攻击过就不能再移动，除非是坦克或蓝图授予的同回合行动能力**。
+    /// 读取剩余移动额度表示；攻击的额度消费由SetAttackerHasAttacked处理，
+    /// 不再额外按HasAttackedThisTurn施加历史门。
     /// </summary>
     public bool CanMoveThisTurn(GameState state)
         => AliveOnBoard
@@ -313,18 +353,21 @@ public sealed class CardInstance
            //    移动侧的蓝图门是 `BP_Logic::CanCardDoAnything`（i=198 是 `IsPinned`），
            //    里面**没有** `isSuppressed`（全文件 0 次）。
            && !HasMovedThisTurn
-           && (IsTank || CanMoveAndAttackInSameTurn || !HasAttackedThisTurn)
            && !HasDeploymentSickness(state);
 
     /// <summary>
-    /// 蓝图的 `CanMoveAndAttackInTheSameTurn` 自定义能力标记。
-    /// `card_unit_obice_da_75_13` 在 Alpine 单位进入或离场时通过
-    /// `CustomName1Add/Remove` 维护这个标记；它和坦克一样允许移动、攻击顺序互换。
+    /// Native CanMoveAndAttackInTheSameTurn: IsArmorUnit (tank,
+    /// tankdestroyer or customName1 isArmorUnit), then the explicit marker.
+    /// Verified against the installed PE implementation and KardsCore enum.
     /// </summary>
     public bool CanMoveAndAttackInSameTurn
-        => CustomJson.TryGetValue("customName1", out string? value)
-           && value.Split(',', StringSplitOptions.RemoveEmptyEntries)
-               .Contains("CanMoveAndAttackInTheSameTurn", StringComparer.Ordinal);
+        => string.Equals(Definition.Type, "tank", StringComparison.OrdinalIgnoreCase)
+           || string.Equals(Definition.Type, "tankdestroyer", StringComparison.OrdinalIgnoreCase)
+           || HasOperationMarker("isArmorUnit")
+           || HasOperationMarker("CanMoveAndAttackInTheSameTurn");
+
+    private bool HasOperationMarker(string marker)
+        => CardCustomNames.Has(this, "customName1", marker);
 
     /// <summary>
     /// 被**抑制**（客户端中文译名；英文关键字 = `Suppress`，字段 = 卡对象上的
@@ -358,8 +401,8 @@ public sealed class CardInstance
     ///
     /// 蓝图的全局派发门是
     /// <c>isSuppressed &amp;&amp; !suppressionExceptionTriggers.Contains(trigger)</c>；
-    /// 当前卡数据没有可加载的白名单来源，因此默认为空，保留一个可扩展的
-    /// 运行时集合，待取得逐卡证据后再填充。
+    /// 建卡时由当前卡定义的 CDO 数组填充；完整卡池的两个触发数组
+    /// 已通过只读客户端内存核查。
     /// </summary>
     public HashSet<string> SuppressionExceptionTriggers { get; } = new(StringComparer.Ordinal);
 
@@ -456,7 +499,18 @@ public sealed class CardInstance
     /// 「够不着（双方都在支援线）」（`out/_pinned-gate/after-389594.txt`）。
     /// `0` = 未钉住。
     /// </summary>
-    public int PinnedTurns { get; set; }
+    private int _pinnedTurns;
+    public int PinnedTurns
+    {
+        get => _pinnedTurns;
+        set
+        {
+            _pinnedTurns = value;
+            if (value > 0) Keywords.Add(Keyword.Pinned);
+            else Keywords.Remove(Keyword.Pinned);
+        }
+    }
+    public bool IsPinned => PinnedTurns > 0;
 
     /// <summary>
     /// **在场上，而且还没死** —— 能不能行动就靠这个。
@@ -480,21 +534,38 @@ public sealed class CardInstance
     /// 是不是坦克。
     ///
     /// ⚠️ 判据是卡数据的 `type` 字段（`card_unit_panzer_ii_a` → `"tank"`）。
-    /// 卡库里 type 的分布（2021 张）：
+    /// 卡库里 type 的分布（2019 张）：
     /// `order` 732 / `infantry` 568 / `location` 180 / **`tank` 154** /
-    /// `fighter` 144 / `bomber` 98 / `artillery` 60 / 其它 85。
+    /// `fighter` 144 / `bomber` 98 / `artillery` 60 / 其它 83。
     ///
-    /// 为什么只认坦克：见 <see cref="CanOperateThisTurn"/> 的注释 ——
-    /// 规则表里只有坦克写了"能在同一回合移动并攻击"。
+    /// 这里只识别严格的tank类型；装甲及同回合行动例外由
+    /// CanMoveAndAttackInSameTurn按原生谓词独立处理。
     /// </summary>
     public bool IsTank
         => string.Equals(Definition.Type, "tank", StringComparison.OrdinalIgnoreCase);
 
     // ---- 关键字 ----
+    // Fury/Blitz here are raw members; use HasKeyword for effective
+    // combat ability, which also includes the received source list.
     public HashSet<string> Keywords { get; } = new(StringComparer.Ordinal);
 
     /// <summary>自定义能力（对应子动作 ActionCustomAbilityAdd/Remove 与 CustomAbilityAdd 调用）。</summary>
-    public string? CustomAbility { get; set; }
+    public string? CustomAbility
+    {
+        get => ReceivedAbilitiesFromCards.Keys.LastOrDefault();
+        set
+        {
+            ReceivedAbilitiesFromCards.Clear();
+            if (!string.IsNullOrEmpty(value)) ReceivedAbilitiesFromCards[value] = [0];
+        }
+    }
+
+    /// <summary>Current pak's ability → ordered, unique source card IDs.</summary>
+    public Dictionary<string, List<int>> ReceivedAbilitiesFromCards { get; } = new(StringComparer.Ordinal);
+    public Dictionary<string, List<int>>? SuppressStrippedAbilities { get; set; }
+
+    /// <summary>Native GameplayTags removed from this instance's CDO container.</summary>
+    public HashSet<string> RemovedGameplayTags { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// 蓝图的 `KreditsTax_AsEnemyTarget` —— **被敌方指定为目标时要多付的费用**。
@@ -516,7 +587,7 @@ public sealed class CardInstance
     public int KreditsTaxAsEnemyTarget { get; set; }
 
     /// <summary>卡牌私有 JSON 暂存（对应游戏里的 JSON_Get*/JSON_Set*/JSON_Clear 一族调用）。</summary>
-    public Dictionary<string, string> CustomJson { get; } = new(StringComparer.Ordinal);
+    public CardCustomJson CustomJson { get; } = new();
 
     /// <summary>
     /// Blueprint TSet members that must survive separate event/function VM
@@ -524,6 +595,9 @@ public sealed class CardInstance
     /// native element type (the gameplay member currently stores card refs).
     /// </summary>
     public Dictionary<string, HashSet<object?>> BlueprintSets { get; } = new(StringComparer.Ordinal);
+
+    /// <summary>InstanceVariable storage shared by separate Blueprint calls/events.</summary>
+    public Dictionary<string, object?> BlueprintVariables { get; } = new(StringComparer.Ordinal);
 
     /// <summary>
     /// buff 记录：(来源卡, 是否临时) → 该来源施加的修正。
@@ -537,6 +611,9 @@ public sealed class CardInstance
     /// 所以拆成两条。
     /// </summary>
     public Dictionary<(int SourceCardId, bool Temporary), CardBuff> BuffsBySource { get; } = new();
+
+    /// <summary>Object-owned native +0x108 array; independent of JSON and current target enumeration.</summary>
+    public List<int> CardsBuffedByThisCard { get; } = new();
 
     /// <summary>
     /// Blueprint's runtime <c>attackBuff</c> member: the aggregate attack
@@ -563,7 +640,7 @@ public sealed class CardInstance
     public bool IsInOwnHalf => Location == Owner.HqOf();
 
     /// <summary>
-    /// 重甲点数 —— 基础值（卡面自带）加上所有来源的临时加成。
+    /// 重甲点数 —— 当前基础值（普通或老兵卡面）加上所有来源的加成。
     ///
     /// 为什么要单独算而不能只看 <see cref="Keywords"/>：`ChangeHeavyArmor(卡, 来源, +1)`
     /// 是可以叠加的数值（客户端另有 `getTotalHeavyArmor`），关键字只能表示「有没有」。
@@ -577,7 +654,7 @@ public sealed class CardInstance
             // ⚠️ 抑制会把**卡面自带**的重甲也清零（蓝图 `L_070E`
             //    `ChangeHeavyArmor(卡, 0, 0, Suppress(3), skipAction=true)`），
             //    所以卡面那一项要能被 <see cref="HeavyArmorZeroedBySuppress"/> 遮蔽。
-            int total = HeavyArmorZeroedBySuppress ? 0 : Definition.HeavyArmor;
+            int total = HeavyArmorZeroedBySuppress ? 0 : VeteranHeavyArmor ?? Definition.HeavyArmor;
             foreach (var buff in BuffsBySource.Values)
             {
                 total += buff.HeavyArmor;
@@ -600,12 +677,69 @@ public sealed class CardInstance
     /// </summary>
     public void InitializeFromDefinition()
     {
+        InitializeRuleAttributesFromDefinition();
+        SelectTargetOnPlayedFromHand = Definition.SelectTargetOnPlayedFromHand;
+        CardCustomNames.Assign(this, "customName1", Definition.CustomName1);
+        CardCustomNames.Assign(this, "customName2", Definition.CustomName2);
+    }
+
+    private void InitializeRuleAttributesFromDefinition()
+    {
+        VeteranOperationCost = null;
+        VeteranHeavyArmor = null;
+        EffectType = Definition.EffectType;
+        ResetRange();
+        ExileNation = 0;
         foreach (string keyword in Definition.Keywords)
         {
             Keywords.Add(keyword);
         }
 
+        Cipher = Definition.Cipher;
+        KreditsTaxAsEnemyTarget = Definition.TargetTax;
+        foreach (var (ability, givers) in Definition.InnateAbilities)
+            ReceivedAbilitiesFromCards[ability] = new List<int>(givers);
+        foreach (string trigger in Definition.SuppressionExceptionTriggers)
+            SuppressionExceptionTriggers.Add(trigger);
+
         RecalculateStats();
+    }
+
+    /// <summary>
+    /// Rule-visible fields written by the current client's native ResetCardAttributes.
+    /// Evidence: live-reset-native-implementation.txt, implementation RVA 0x4b09020.
+    /// Owner/index restoration is performed by CardApi before reset events.
+    /// Blueprint instance variables and unrelated CustomJson keys survive.
+    /// </summary>
+    public void ResetAttributes()
+    {
+        BuffsBySource.Clear();
+        ReceivedAbilitiesFromCards.Clear();
+        Keywords.Clear();
+        RemovedGameplayTags.Clear();
+        HeavyArmorZeroedBySuppress = false;
+        SuppressedOnTurn = -1;
+        SuppressStrippedKeywords = null;
+        SuppressStrippedBuffs = null;
+        SuppressStrippedCustomAbility = null;
+        SuppressStrippedAbilities = null;
+        InitializeRuleAttributesFromDefinition();
+        // Native ResetCardAttributes restores +0x504 from the card template;
+        // +0x50c is not overwritten by that function.
+        CardCustomNames.Assign(this, "customName1", Definition.CustomName1);
+        Attack = IsSalvaged ? 1 : Definition.Attack;
+        Defense = MaxDefense = IsSalvaged ? 1 : Definition.Defense;
+        KreditCost = IsSalvaged ? Math.Min(3, Definition.Kredits) : Definition.Kredits;
+        PinnedTurns = 0;
+        GotchaActivated = 0;
+        CardSeen = false;
+        UnderEnemyControl = false;
+        HasMovedThisTurn = false;
+        AttacksThisTurn = 0;
+        AttackQuotaOffset = 0;
+        IsRevealed = false;
+        foreach (string key in new[] { "effects", "handbuff", "veteran", "countdown_timer", "extra_play_triggers" })
+            CustomJson.Remove(key);
     }
 
     /// <summary>
@@ -648,11 +782,16 @@ public sealed class CardInstance
 
         Name = name;
         Definition = def;
+        EffectType = def.EffectType;
 
         // 基础数值：搬差值（保留 buff 与已受伤害）
         Attack += def.Attack - oldDef.Attack;
         Defense += def.Defense - oldDef.Defense;
         MaxDefense += def.Defense - oldDef.Defense;
+        if (_rangeOverride is int rangeOverride)
+        {
+            _rangeOverride = rangeOverride + def.Range - oldDef.Range;
+        }
 
         // 卡面关键字：撤掉旧卡面的，灌入新卡面的
         foreach (string kw in oldDef.Keywords)
@@ -704,7 +843,7 @@ public sealed class CardInstance
     {
         get
         {
-            int total = Definition.Kredits;
+            int total = IsSalvaged ? Math.Min(3, Definition.Kredits) : Definition.Kredits;
             foreach (var buff in BuffsBySource.Values)
             {
                 total += buff.KreditCost;
@@ -717,7 +856,7 @@ public sealed class CardInstance
     /// <summary>所有卡牌的通用费用下限；卡面明确写 minimum of 1 的效果另行处理。</summary>
     public const int MinKreditCost = 0;
 
-    /// <summary>有效行动费用 = 卡面行动费用 + 各来源的加减（下限 0）。</summary>
+    /// <summary>有效行动费用 = 当前普通/老兵基础行动费用 + 各来源的加减（下限 0）。</summary>
     public int EffectiveOperationCost
     {
         get
@@ -728,7 +867,7 @@ public sealed class CardInstance
                 .Where(buff => buff.OperationCostSetsAbsoluteValue)
                 .LastOrDefault();
             int total = absolute is null
-                ? Definition.OperationCost
+                ? VeteranOperationCost ?? Definition.OperationCost
                 : Definition.OperationCost + absolute.OperationCost;
             foreach (var buff in BuffsBySource.Values)
             {
@@ -752,22 +891,91 @@ public sealed class CardInstance
         Attack, Defense, MaxDefense, KreditCost, OperationCost,
         EnteredPlayOnTurn, OperationsUsedThisTurn, HasAttackedThisTurn, HasMovedThisTurn,
         AttacksThisTurn,
-        Keywords.OrderBy(k => k, StringComparer.Ordinal).ToArray(),
+        Keywords.Concat(HasFury ? new[] { Keyword.Fury } : Array.Empty<string>())
+            .Concat(HasBlitz ? new[] { Keyword.Blitz } : Array.Empty<string>())
+            .Concat(HasGuard ? new[] { Keyword.Guard } : Array.Empty<string>())
+            .Concat(HasSmokescreen ? new[] { Keyword.Smokescreen } : Array.Empty<string>())
+            .Distinct(StringComparer.Ordinal).OrderBy(k => k, StringComparer.Ordinal).ToArray(),
         CustomAbility,
         CustomJson.OrderBy(kv => kv.Key, StringComparer.Ordinal).ToDictionary(kv => kv.Key, kv => kv.Value))
         {
+            CustomJsonTypes = CustomJson.Keys.OrderBy(k => k, StringComparer.Ordinal).ToDictionary(k => k, CustomJson.TypeOf),
+            CardsBuffedByThisCard = CardsBuffedByThisCard.ToArray(),
+            SelectTargetOnPlayedFromHand = SelectTargetOnPlayedFromHand,
+            HasEverAttacked = HasEverAttacked,
+            VeteranOperationCost = VeteranOperationCost,
+            VeteranHeavyArmor = VeteranHeavyArmor,
+            EffectType = EffectType,
+            Range = Range,
+            ExileNation = ExileNation,
+            KreditsTaxAsEnemyTarget = KreditsTaxAsEnemyTarget,
+            AttackQuotaOffset = AttackQuotaOffset,
+            IntrinsicFury = Keywords.Contains(Keyword.Fury),
+            IntrinsicBlitz = Keywords.Contains(Keyword.Blitz),
+            IsBeingGuarded = IsBeingGuarded,
+            IntrinsicGuard = Keywords.Contains(Keyword.Guard),
+            IntrinsicSmokescreen = Keywords.Contains(Keyword.Smokescreen),
+            GuardBuffsBySource = BuffsBySource.Where(kv => kv.Value.Guard != 0)
+                .OrderBy(kv => kv.Key.SourceCardId).ThenBy(kv => kv.Key.Temporary)
+                .ToDictionary(kv => $"{kv.Key.SourceCardId}/{kv.Key.Temporary}", kv => kv.Value.Guard),
+            SmokescreenBuffsBySource = BuffsBySource.Where(kv => kv.Value.Smokescreen != 0)
+                .OrderBy(kv => kv.Key.SourceCardId).ThenBy(kv => kv.Key.Temporary)
+                .ToDictionary(kv => $"{kv.Key.SourceCardId}/{kv.Key.Temporary}", kv => kv.Value.Smokescreen),
+            PinnedBuffsBySource = BuffsBySource.Where(kv => kv.Value.Pinned != 0)
+                .OrderBy(kv => kv.Key.SourceCardId).ThenBy(kv => kv.Key.Temporary)
+                .ToDictionary(kv => $"{kv.Key.SourceCardId}/{kv.Key.Temporary}", kv => kv.Value.Pinned),
+            DestructionBuffsBySource = BuffsBySource.Where(kv => kv.Value.Destruction != 0)
+                .OrderBy(kv => kv.Key.SourceCardId).ThenBy(kv => kv.Key.Temporary)
+                .ToDictionary(kv => $"{kv.Key.SourceCardId}/{kv.Key.Temporary}", kv => kv.Value.Destruction),
+            CustomAbilityBuffDetails = BuffsBySource.Where(kv => kv.Value.CustomAbilityDetails.Count > 0)
+                .OrderBy(kv => kv.Key.SourceCardId).ThenBy(kv => kv.Key.Temporary)
+                .ToDictionary(kv => $"{kv.Key.SourceCardId}/{kv.Key.Temporary}",
+                    kv => kv.Value.CustomAbilityDetails.OrderBy(x => x, StringComparer.Ordinal).ToArray()),
+            BlitzBuffsBySource = BuffsBySource.Where(kv => kv.Value.Blitz != 0)
+                .OrderBy(kv => kv.Key.SourceCardId).ThenBy(kv => kv.Key.Temporary)
+                .ToDictionary(kv => $"{kv.Key.SourceCardId}/{kv.Key.Temporary}", kv => kv.Value.Blitz),
+            FuryBuffsBySource = BuffsBySource.Where(kv => kv.Value.Fury != 0)
+                .OrderBy(kv => kv.Key.SourceCardId).ThenBy(kv => kv.Key.Temporary)
+                .ToDictionary(kv => $"{kv.Key.SourceCardId}/{kv.Key.Temporary}", kv => kv.Value.Fury),
             HasBeenAttackedThisTurn = HasBeenAttackedThisTurn,
             PinnedTurns = PinnedTurns,
             IsRevealed = IsRevealed,
             IsSalvaged = IsSalvaged,
             SalvageFaction = SalvageFaction,
             SalvagedCardId = SalvagedCardId,
+            Cipher = Cipher,
+            CardSeen = CardSeen,
+            GotchaActivated = GotchaActivated,
+            OriginalOwner = OriginalOwner,
+            UnderEnemyControl = UnderEnemyControl,
+            ReceivedAbilitiesFromCards = ReceivedAbilitiesFromCards
+                .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                .ToDictionary(kv => kv.Key, kv => kv.Value.ToArray(), StringComparer.Ordinal),
+            RemovedGameplayTags = RemovedGameplayTags.OrderBy(x => x, StringComparer.Ordinal).ToArray(),
+            BlueprintVariables = BlueprintVariables.OrderBy(kv => kv.Key, StringComparer.Ordinal)
+                .ToDictionary(kv => kv.Key, kv => SnapshotBlueprintValue(kv.Value), StringComparer.Ordinal),
             BlueprintSets = BlueprintSets
                 .OrderBy(kv => kv.Key, StringComparer.Ordinal)
                 .ToDictionary(kv => kv.Key,
                     kv => kv.Value.Select(v => v is CardInstance card ? card.CardId : v is int id ? id : 0)
                         .OrderBy(id => id).ToArray(), StringComparer.Ordinal),
         };
+
+    // Blueprint references become IDs; collections are copied recursively so
+    // later execution cannot alter a saved determinism/audit snapshot.
+    private static object? SnapshotBlueprintValue(object? value) => value switch
+    {
+        CardInstance card => card.CardId,
+        System.Collections.IDictionary map => map.Keys.Cast<object>()
+            .OrderBy(k => Convert.ToString(k, System.Globalization.CultureInfo.InvariantCulture), StringComparer.Ordinal)
+            .ToDictionary(k => Convert.ToString(k, System.Globalization.CultureInfo.InvariantCulture)!,
+                k => SnapshotBlueprintValue(map[k]), StringComparer.Ordinal),
+        HashSet<object?> set => set.Select(SnapshotBlueprintValue)
+            .OrderBy(v => System.Text.Json.JsonSerializer.Serialize(v), StringComparer.Ordinal).ToArray(),
+        System.Collections.IEnumerable items when value is not string => items.Cast<object?>()
+            .Select(SnapshotBlueprintValue).ToArray(),
+        _ => value,
+    };
 }
 
 /// <summary>某个来源施加在卡上的持续修正。</summary>
@@ -794,6 +1002,21 @@ public sealed class CardBuff
     /// <summary>重甲点数（可叠加的数值，不是布尔）。</summary>
     public int HeavyArmor { get; set; }
 
+    /// <summary>combat_fury amount in this source's buff ledger; independent of the ability source array.</summary>
+    public int Fury { get; set; }
+    /// <summary>combat/blitz source amount, separate from received-ability registration.</summary>
+    public int Blitz { get; set; }
+    /// <summary>combat_smokescreen source amount; separate from received-ability registration.</summary>
+    public int Smokescreen { get; set; }
+    /// <summary>Type-6 guard detail, independent of raw flag and source registration.</summary>
+    public int Guard { get; set; }
+    /// <summary>type-6 destruction amount; independent of raw hasDestruction and source arrays.</summary>
+    public int Destruction { get; set; }
+    public int Pinned { get; set; }
+    // customAdd stores a zero-valued type-5 entry. Presence, not its numeric
+    // amount or the number of abilities, determines whether this record exists.
+    public HashSet<string> CustomAbilityDetails { get; init; } = new(StringComparer.Ordinal);
+
     /// <summary>
     /// 这个来源的改费是「显式设成绝对值」而不是「相对减费」。
     ///
@@ -806,8 +1029,9 @@ public sealed class CardBuff
     public int Duration { get; set; } = -1;   // -1 = 永久
 
     /// <summary>
-    /// 这个来源的修正是「到回合结束为止」（<c>EChangeType::tempBuffGive = 0</c>），
-    /// 会在该方回合结束时被 <see cref="CardApi.RemoveTemporaryBuffs"/> 撤掉。
+    /// Removable source slot (<c>EChangeType::tempBuffGive = 0</c>), not a duration.
+    /// Turn-end expiry additionally requires AddBuffsToRemoveEndOfTurn registration;
+    /// persistent auras and positional modifiers use this same source-slot kind.
     ///
     /// 出处（两处独立互证）：
     /// 1. `BP_CardFunctions.AddAttackUntilEndOfTurn` si=4 调
@@ -826,8 +1050,8 @@ public sealed class CardBuff
     public bool Temporary { get; set; }
 
     public bool IsEmpty => Attack == 0 && Defense == 0 && KreditCost == 0
-                           && OperationCost == 0 && HeavyArmor == 0
-                           && !KreditCostSetsAbsoluteValue
+                           && OperationCost == 0 && HeavyArmor == 0 && Fury == 0 && Blitz == 0 && Smokescreen == 0 && Guard == 0 && Destruction == 0 && Pinned == 0
+                           && CustomAbilityDetails.Count == 0 && !KreditCostSetsAbsoluteValue
                            && !OperationCostSetsAbsoluteValue;
 
     /// <summary>
@@ -843,6 +1067,13 @@ public sealed class CardBuff
         KreditCost = KreditCost,
         OperationCost = OperationCost,
         HeavyArmor = HeavyArmor,
+        Fury = Fury,
+        Blitz = Blitz,
+        Smokescreen = Smokescreen,
+        Guard = Guard,
+        Destruction = Destruction,
+        Pinned = Pinned,
+        CustomAbilityDetails = new HashSet<string>(CustomAbilityDetails, StringComparer.Ordinal),
         KreditCostSetsAbsoluteValue = KreditCostSetsAbsoluteValue,
         OperationCostSetsAbsoluteValue = OperationCostSetsAbsoluteValue,
         Duration = Duration,
@@ -873,13 +1104,44 @@ public sealed record CardSnapshot(
     string? CustomAbility,
     Dictionary<string, string> CustomJson)
 {
+    public Dictionary<string, CardJsonType> CustomJsonTypes { get; init; } = new(StringComparer.Ordinal);
+    public bool SelectTargetOnPlayedFromHand { get; init; }
+    public bool HasEverAttacked { get; init; }
+    public int? VeteranOperationCost { get; init; }
+    public int? VeteranHeavyArmor { get; init; }
+    public int EffectType { get; init; }
+    public int Range { get; init; }
+    public int ExileNation { get; init; }
+    public int KreditsTaxAsEnemyTarget { get; init; }
+    public int AttackQuotaOffset { get; init; }
+    public bool IntrinsicFury { get; init; }
+    public bool IntrinsicBlitz { get; init; }
+    public bool IsBeingGuarded { get; init; }
+    public bool IntrinsicGuard { get; init; }
+    public bool IntrinsicSmokescreen { get; init; }
+    public Dictionary<string, int> GuardBuffsBySource { get; init; } = new(StringComparer.Ordinal);
+    public Dictionary<string, int> SmokescreenBuffsBySource { get; init; } = new(StringComparer.Ordinal);
+    public int[] CardsBuffedByThisCard { get; init; } = [];
+    public Dictionary<string, int> PinnedBuffsBySource { get; init; } = new(StringComparer.Ordinal);
+    public Dictionary<string, int> DestructionBuffsBySource { get; init; } = new(StringComparer.Ordinal);
+    public Dictionary<string, string[]> CustomAbilityBuffDetails { get; init; } = new(StringComparer.Ordinal);
+    public Dictionary<string, int> BlitzBuffsBySource { get; init; } = new(StringComparer.Ordinal);
+    public Dictionary<string, int> FuryBuffsBySource { get; init; } = new(StringComparer.Ordinal);
     public bool HasBeenAttackedThisTurn { get; init; }
     public int PinnedTurns { get; init; }
     public bool IsRevealed { get; init; }
     public bool IsSalvaged { get; init; }
     public string? SalvageFaction { get; init; }
     public int SalvagedCardId { get; init; }
+    public int Cipher { get; init; }
+    public bool CardSeen { get; init; }
+    public int GotchaActivated { get; init; }
+    public Side OriginalOwner { get; init; }
+    public bool UnderEnemyControl { get; init; }
     public Dictionary<string, int[]> BlueprintSets { get; init; } = new(StringComparer.Ordinal);
+    public Dictionary<string, int[]> ReceivedAbilitiesFromCards { get; init; } = new(StringComparer.Ordinal);
+    public string[] RemovedGameplayTags { get; init; } = [];
+    public Dictionary<string, object?> BlueprintVariables { get; init; } = new(StringComparer.Ordinal);
 }
 
 /// <summary>

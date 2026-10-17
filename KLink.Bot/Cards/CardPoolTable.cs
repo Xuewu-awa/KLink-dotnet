@@ -28,6 +28,7 @@ internal static class CardPoolTable
     /// </summary>
     public static int CardSetIdOf(string? cardSet) => cardSet switch
     {
+        "NotAvailable" => 0,
         "Basic" => 1,
         "Special" => 2,
         "OnlySpawnable" => 3,

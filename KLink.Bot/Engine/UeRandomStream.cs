@@ -25,17 +25,15 @@ namespace KLink.Bot.Engine;
 /// - 播种：`BP_CardFunctions::SetRandomStreamByMatchID(MatchID)` 里
 ///   `cardsRandomStream = MakeRandomStream(MatchID)`（`BP_CardFunctions.cpp:12339-12347`），
 ///   对局开始时用 `match_id` 播一次（`BP_OnlineMatch.cpp:1734-1744`）。
-/// - ⚠️ **2026-08-25 之后不再逐动作重播种**：服务端撤回了 `validate_turn_switches`，
-///   `SetRandomStreamWithActionID`（`BP_OnlineMatch.cpp:24520-24536`）的重播种分支不再触发，
-///   `cardsRandomStream` 从开局那一次播种起**连续自由推进**。
-///   本仓库的 4 局回放都是 2026-10 采的，落在调整之后，所以内核只要
-///   "以 `match_id` 播种一次、然后连续推进"即可。
+/// - 当前 pak 的 `BP_OnlineMatch:SetRandomStreamWithActionID` 仅含 Return/Nothing
+///   和 EndOfScript；虽仍有行动接收/创建调用点，函数本身不重播种（RULE-105）。
+///   此结论来自当前资产，不能据此推断服务端历史改动日期或所有恢复路径。
 ///
 /// ## 验证
 ///
 /// 报告 `Weather.md` §4.2.1 给了一组**可复算的测试向量**
 /// （`match_id=1000000000`、重播种用 `CurrentActionId=10` ⇒ `seed=1000193900`，
-/// 连抽三次 `RandomIntFromRangeWithStream(0,2)`）：
+/// 连抽三次原始 `RandomIntegerInRangeFromStream(0,2)`）：
 /// <code>
 ///   第1次：Seed 1000193900 → 1626977479，返回 1
 ///   第2次：Seed 1626977479 → 4280773790，返回 2
@@ -128,13 +126,10 @@ public sealed class UeRandomStream
     /// </summary>
     public int RandRange(int min, int max)
     {
-        if (max < min)
-        {
-            (min, max) = (max, min);
-        }
-
-        int range = max - min + 1;
-        return min + (int)(GetFraction() * range);
+        // Current native wrapper RVA 0x3dddd90: signed 32-bit range <= 0
+        // returns Min without mutating the stream (i=0x3ddde8a..0x3ddded9).
+        int range = unchecked(max - min + 1);
+        return range <= 0 ? min : unchecked(min + (int)(GetFraction() * range));
     }
 
     /// <summary>从 `maxExclusive` 个里挑一个下标（= `RandRange(0, maxExclusive-1)`）。</summary>

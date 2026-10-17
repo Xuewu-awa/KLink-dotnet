@@ -1,0 +1,22 @@
+[
+  {
+    "old": "e.Api.MakeVeteran(Plain(s, victim, 63))",
+    "new": "e.Api.MakeVeteran(Plain(s, \"card_unit_102_rifles\", 63))"
+  },
+  {
+    "old": "private static string? EventLayerSuppressionGate(CardDatabase db)\n    {\n        const string victim = \"card_unit_arado_ar_196\";",
+    "new": "private static string? EventLayerSuppressionGate(CardDatabase db)\n    {\n        const string victim = \"card_unit_102_rifles\";"
+  },
+  {
+    "old": "var args = new object?[] { unit, 1, spawner.CardId, null, true, null, 0, -1, true };",
+    "new": "var args = new object?[] { \"card_unit_269th_rifles\", 1, spawner.CardId, null, true, null, 0, -1, true };"
+  },
+  {
+    "old": "private static string? SpawnMultipleCardsOnBattlefield(CardDatabase db)\n    {\n        const string unitName = \"card_unit_arado_ar_196\";",
+    "new": "private static string? SpawnMultipleCardsOnBattlefield(CardDatabase db)\n    {\n        const string unitName = \"card_unit_269th_rifles\";"
+  },
+  {
+    "old": "const string spawnedName = \"card_unit_brewster_f2a\";",
+    "new": "const string spawnedName = \"card_unit_269th_rifles\";"
+  }
+]

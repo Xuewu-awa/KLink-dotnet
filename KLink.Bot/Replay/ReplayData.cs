@@ -32,8 +32,8 @@ public sealed class ReplayData
     /// 详见 `GameState.NextCardId`。以前只给"客户端那一方"用是错的，
     /// 会导致 bot 生成卡发顺序号 ⇒ 客户端认不出 ⇒ **虚空部署**。
     ///
-    /// 现在这个字段只作为**诊断信息**保留（"哪一方是真人在打"），
-    /// 判据如下：
+    /// 这个字段同时用于回放时初始化 `GameState.ClientSide`，并保留为
+    /// 诊断信息（"哪一方是真人在打"）。判据如下：
     /// <list type="bullet">
     /// <item>fyserver 给 bot 的占位 id 是**负数**（`-9178` = KLink，见 `tools/BotNameTest`），
     ///   7 局服务端回放全是「左=人类、右=bot」。</item>
